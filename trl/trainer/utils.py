@@ -1746,11 +1746,11 @@ def _compute_logps_with_prompt_cache(
 
 # VRAM optimized version
 def compute_logps_with_prompt_cache(
-model: torch.nn.Module,
-prompt_inputs: dict,
-completion_ids: torch.LongTensor,
-mini_batch_size: int,
-requires_grad_for_completion: bool = True,
+    model: torch.nn.Module,
+    prompt_inputs: dict,
+    completion_ids: torch.LongTensor,
+    mini_batch_size: int,
+    requires_grad_for_completion: bool = True,
 ) -> torch.FloatTensor:
     """
     Compute log probabilities of completion tokens using prompt cache with optimized memory and computation.
@@ -1798,6 +1798,10 @@ requires_grad_for_completion: bool = True,
     repeated_kv_cache.batch_repeat_interleave(G)
     mini_batch_kv_caches = repeated_kv_cache.batch_split(full_batch_size=B * G, split_size=mini_batch_size)
 
+    # Create attention mask for completion tokens
+    completion_attention_mask = torch.ones_like(completion_ids)
+    prompt_attention_mask_repeated = prompt_inputs["attention_mask"].repeat_interleave(G, dim=0)
+
     # Precompute indices for completion tokens
     next_token_indices = completion_ids[:, 1:].unsqueeze(-1)  # (B*G, C-1, 1)
 
@@ -1807,10 +1811,15 @@ requires_grad_for_completion: bool = True,
         end_idx = min(start_idx + mini_batch_size, B*G)
         mini_batch_ids = completion_ids[start_idx:end_idx]  # (mini_batch_size, C)
         mini_batch_indices = next_token_indices[start_idx:end_idx]
+        mini_batch_attention_mask = torch.cat([
+            prompt_attention_mask_repeated[start_idx:end_idx],
+            completion_attention_mask[start_idx:end_idx]
+        ], dim=1)
 
         with torch.set_grad_enabled(requires_grad_for_completion):
             mini_batch_logits = model(
                 input_ids=mini_batch_ids,
+                attention_mask=mini_batch_attention_mask,
                 past_key_values=mini_batch_kv_cache,
                 logits_to_keep=C,
                 use_cache=False,
