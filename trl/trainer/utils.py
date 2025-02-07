@@ -1778,7 +1778,7 @@ requires_grad_for_completion: bool = True,
     
     # Process prompt
     with torch.no_grad():
-        prompt_out = model(**prompt_inputs, use_cache=True, num_logits_to_keep=1)
+        prompt_out = model(**prompt_inputs, use_cache=True, logits_to_keep=1)
         
         # Optimized prompt logprobs computation
         last_logits = prompt_out.logits[:, -1:]
@@ -1812,7 +1812,7 @@ requires_grad_for_completion: bool = True,
             mini_batch_logits = model(
                 input_ids=mini_batch_ids,
                 past_key_values=mini_batch_kv_cache,
-                num_logits_to_keep=C,
+                logits_to_keep=C,
                 use_cache=False,
             ).logits[:, -C:-1, :]  # (mini_batch_size, C-1, vocab_size)
 
