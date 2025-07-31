@@ -93,6 +93,7 @@ EXTRAS = {
     "test": ["parameterized", "pytest-cov", "pytest-rerunfailures", "pytest-xdist", "pytest"],
     "vllm": ["vllm; sys_platform != 'win32'"],  # vllm is not available on Windows
     "vlm": ["Pillow"],
+    "graph": ["neo4j>=5.0.0"],
 }
 EXTRAS["dev"] = []
 for reqs in EXTRAS.values():
