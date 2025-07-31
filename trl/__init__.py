@@ -49,6 +49,11 @@ _import_structure = {
         "create_reference_model",
         "setup_chat_format",
     ],
+    "navigator": [
+        "Neo4jKGEnv",
+        "OnlineDialogueDataset",
+        "make_dataloader",
+    ],
     "trainer": [
         "AlignPropConfig",
         "AlignPropTrainer",
