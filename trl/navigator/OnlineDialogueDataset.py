@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from typing import List, Dict, Any, Callable
 
-_NAV = re.compile(r"navigate\s*\(\s*([^)]+)\s*\)", re.I)
+_NAV = re.compile(r'^navigate\(([A-Za-z0-9_\-\/.#]+)\)$')
 _STOP = re.compile(r"stop\s*\(\s*\)", re.I)
 
 def parse_cmd(text: str) -> Dict[str, Any]:
