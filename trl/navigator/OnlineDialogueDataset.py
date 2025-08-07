@@ -100,7 +100,6 @@ class OnlineDialogueDataset(IterableDataset):
 
     def __iter__(self):
         indices = list(range(len(self.init_prompts)))
-        random.shuffle(indices)
         for idx in indices:
             env  = self.env
             init = self.init_prompts[idx]
@@ -108,6 +107,18 @@ class OnlineDialogueDataset(IterableDataset):
                 self.model, self.tokenizer, env, init,
                 reward_fn=self.reward_fn, **self.kwargs
             )
+
+    def __len__(self):
+        return len(self.init_prompts)
+
+    def __getitem__(self, idx):
+        init_prompt = self.init_prompts[idx]
+        env = self.env                    # fresh environment each call
+        return collect_episode(
+            self.model, self.tokenizer, env, init_prompt,
+            reward_fn=self.reward_fn,
+            **self.kwargs
+        )
 
 def make_collate_fn(tokenizer):
     pad_id = tokenizer.pad_token_id
