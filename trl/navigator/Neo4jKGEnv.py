@@ -91,7 +91,8 @@ You have following options available, as response:
         self._require_reset()
         details, neigh = self._fetch(node_id)
         if details is None:
-            obs, done = f"No node with id '{node_id}'.", False
+            self.trajectory.append("__FAILED__")
+            obs, done = f"No node with id '{node_id}'.", True
         else:
             self.curr_node = node_id
             self.trajectory.append(node_id)

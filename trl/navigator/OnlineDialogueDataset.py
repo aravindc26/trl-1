@@ -47,7 +47,8 @@ def collect_episode(
         elif cmd["action"] == "stop":
             obs, done = env.stop()
         else:
-            obs, done = "Invalid command", False
+            env.trajectory.append("__FAILED__")
+            obs, done = "Invalid command", True
             history.extend([
                 {"role": "assistant", "content": assistant_msg},
                 {"role": "user",      "content": obs},
