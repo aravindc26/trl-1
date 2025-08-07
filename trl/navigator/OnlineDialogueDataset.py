@@ -31,7 +31,7 @@ def collect_episode(
         # 2·1  flatten dialogue ↦ input_ids
         ctx_txt = "".join(f"<|{m['role']}|>{m['content']}" for m in history)
         ctx_ids = tokenizer(ctx_txt, return_tensors="pt",
-                            truncation=True, max_length=2048).input_ids.to(device)
+                            truncation=True, max_length=10000).input_ids.to(device)
 
         # 2·2  model generates next assistant turn
         with torch.no_grad():
@@ -64,10 +64,10 @@ def collect_episode(
     completion_txt = env.history[-2]["content"]              # last assistant msg
 
     prompt_ids     = tokenizer(prompt_txt,
-                               truncation=True, max_length=2048,
+                               truncation=True, max_length=10000,
                                add_special_tokens=False).input_ids
     completion_ids = tokenizer(completion_txt,
-                               truncation=True, max_length=512,
+                               truncation=True, max_length=10000,
                                add_special_tokens=False).input_ids
 
     return {
