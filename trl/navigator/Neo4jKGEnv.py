@@ -23,7 +23,7 @@ class Neo4jKGEnv:
         self.reset_called = False
 
     def reset(self, initial_prompt: str):
-        self.history, self.trajectory = [], []
+        self.history, self.trajectory, self.cache = [], [], {}
         self.curr_node, self.reset_called = None, True
 
         vec = self.embed_fn(initial_prompt)
@@ -101,6 +101,7 @@ You have following options available, as response:
                     f"label: {details['label']}\n"
                     f"text : {text[:200]}{'...' if len(text)>200 else ''}\n"
                     f"Neighbours: {nbs}")
+            self.cache[node_id] = obs
             done = False
         self.history += [{"role":"assistant","content":f"navigate({node_id})"},
                          {"role":"user","content":obs}]

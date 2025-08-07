@@ -19,7 +19,7 @@ def collect_episode(
     tokenizer,
     env,
     init_prompt: str,
-    reward_fn: Callable[[str, List[str], List[Dict[str, str]]], float],
+    reward_fn: Callable[[str, List[str], List[Dict[str, str]], Dict[str, str]], float],
     max_turns: int = 10,
     max_tokens: int = 128,
     device: str = "cuda",
@@ -56,7 +56,7 @@ def collect_episode(
             break
 
     # 2·4  external reward & tensors
-    reward = reward_fn(init_prompt, env.trajectory, env.history)
+    reward = reward_fn(init_prompt, env.trajectory, env.history, env.cache)
 
     prompt_txt = "".join(f"<|{m['role']}|>{m['content']}"
                          for m in env.history[:-2])          # up to last user msg
@@ -82,7 +82,7 @@ class OnlineDialogueDataset(IterableDataset):
         tokenizer,
         env,
         init_prompts: List[str],
-        reward_fn: Callable[[str, List[str], List[Dict[str, str]]], float],
+        reward_fn: Callable[[str, List[str], List[Dict[str, str]], Dict[str, str]], float],
         *,
         max_turns: int = 10,
         max_tokens: int = 128,
