@@ -99,9 +99,11 @@ class OnlineDialogueDataset(IterableDataset):
                                 device=device)
 
     def __iter__(self):
-        while True:
+        indices = list(range(len(self.init_prompts)))
+        random.shuffle(indices)
+        for idx in indices:
             env  = self.env
-            init = random.choice(self.init_prompts)
+            init = self.init_prompts[idx]
             yield collect_episode(
                 self.model, self.tokenizer, env, init,
                 reward_fn=self.reward_fn, **self.kwargs
