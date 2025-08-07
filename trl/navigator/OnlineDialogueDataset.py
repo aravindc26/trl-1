@@ -19,7 +19,7 @@ def collect_episode(
     tokenizer,
     env,
     init_prompt: str,
-    reward_fn: Callable[[List[str], List[Dict[str, str]]], float],
+    reward_fn: Callable[[str, List[str], List[Dict[str, str]]], float],
     max_turns: int = 10,
     max_tokens: int = 128,
     device: str = "cuda",
@@ -56,7 +56,7 @@ def collect_episode(
             break
 
     # 2·4  external reward & tensors
-    reward = reward_fn(env.trajectory, env.history)
+    reward = reward_fn(init_prompt, env.trajectory, env.history)
 
     prompt_txt = "".join(f"<|{m['role']}|>{m['content']}"
                          for m in env.history[:-2])          # up to last user msg
@@ -80,9 +80,9 @@ class OnlineDialogueDataset(IterableDataset):
         self,
         model,
         tokenizer,
-        env_cls,
+        env,
         init_prompts: List[str],
-        reward_fn: Callable[[List[str], List[Dict[str, str]]], float],
+        reward_fn: Callable[[str, List[str], List[Dict[str, str]]], float],
         *,
         max_turns: int = 10,
         max_tokens: int = 128,
@@ -90,7 +90,7 @@ class OnlineDialogueDataset(IterableDataset):
     ):
         self.model       = model
         self.tokenizer   = tokenizer
-        self.env_cls     = env_cls
+        self.env         = env
         self.init_prompts= init_prompts
         self.reward_fn   = reward_fn
         self.kwargs      = dict(max_turns=max_turns,
@@ -99,7 +99,7 @@ class OnlineDialogueDataset(IterableDataset):
 
     def __iter__(self):
         while True:
-            env  = self.env_cls()
+            env  = self.env
             init = random.choice(self.init_prompts)
             yield collect_episode(
                 self.model, self.tokenizer, env, init,
@@ -125,7 +125,7 @@ def make_collate_fn(tokenizer):
 def make_dataloader(
     model,
     tokenizer,
-    env_cls,
+    env,
     init_prompts,
     reward_fn,
     *,
@@ -136,7 +136,7 @@ def make_dataloader(
     device: str = "cuda",
 ):
     dataset = OnlineDialogueDataset(
-        model, tokenizer, env_cls, init_prompts, reward_fn,
+        model, tokenizer, env, init_prompts, reward_fn,
         max_turns=max_turns, max_tokens=max_tokens, device=device
     )
     return DataLoader(
