@@ -100,7 +100,7 @@ You have following options available, as response:
             text = details.get("content") or details.get("description") or ""
             obs  = (f"Node {details['id']} ({details['type']}):\n"
                     f"label: {details['label']}\n"
-                    f"text : {text[:200]}{'...' if len(text)>200 else ''}\n"
+                    f"text : {text}\n"
                     f"Neighbours: {nbs}")
             self.cache[node_id] = details
             done = False
