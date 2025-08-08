@@ -3,33 +3,63 @@ from trl import GRPOTrainer
 import torch
 
 class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
-    @override
     def training_step(
         self,
         model: torch.nn.Module,
-        inputs: dict[str, torch.Tensor],
-        num_items_in_batch: int | None = None,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        num_items_in_batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        model.train()
 
-        input_ids     = torch.cat([inputs["prompt_ids"],
-                                   inputs["completion_ids"]], dim=-1)
-        attention_mask = input_ids.ne(self.tokenizer.pad_token_id).long()
+        # move tensors to device
+        for k, v in list(inputs.items()):
+            if torch.is_tensor(v):
+                inputs[k] = v.to(self.args.device)
 
-        with self.compute_loss_context():
-            policy_logits = model(input_ids, attention_mask=attention_mask,
-                                  use_cache=False).logits
-            ref_logits    = self.ref_model(input_ids, attention_mask=attention_mask,
-                                           use_cache=False).logits
+        # build full sequence + attention
+        prompt_ids, completion_ids = inputs["prompt_ids"], inputs["completion_ids"]
+        prompt_mask = inputs.get("prompt_mask") or (prompt_ids != self.tokenizer.pad_token_id).long()
+        completion_mask = inputs.get("completion_mask") or (completion_ids != self.tokenizer.pad_token_id).long()
 
-        resp_start = inputs["prompt_ids"].shape[1]
-        logp_pol   = policy_logits[:, resp_start:].log_softmax(-1)
-        logp_ref   = ref_logits[:,  resp_start:].log_softmax(-1)
-        rewards    = inputs["rewards"].unsqueeze(-1).to(logp_pol)
+        input_ids      = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+
+        # reference per-token logps (handles reference-free LoRA too)
+        if getattr(self, "ref_model", None) is not None:
+            with torch.no_grad():
+                ref_logps = self._get_per_token_logps(self.ref_model, input_ids, attention_mask, logits_to_keep)
+        else:
+            with self.accelerator.unwrap_model(model).disable_adapter(), torch.no_grad():
+                ref_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+
+        # advantages from your external rewards
+        rewards = inputs.pop("rewards").view(-1).to(input_ids)
         advantages = rewards - rewards.mean()
 
-        loss = -(advantages * (logp_pol - logp_ref).detach()).mean()
+        # hand off to TRL's GRPO loss
+        inputs.update({
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "ref_per_token_logps": ref_logps,
+            "advantages": advantages,
+        })
 
-        if num_items_in_batch:
-            loss = loss / num_items_in_batch
+        # compatible context manager name across versions
+        ctx = getattr(self, "compute_loss_context_manager",
+                      getattr(self, "compute_loss_context"))
 
-        return loss
+        with ctx():
+            loss = super().compute_loss(
+                model,
+                inputs,
+                return_outputs=False,
+                num_items_in_batch=num_items_in_batch,   # just pass it through
+            )
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()
+        self.accelerator.backward(loss)
+        return loss.detach() / self.args.gradient_accumulation_steps
