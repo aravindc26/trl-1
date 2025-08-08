@@ -37,7 +37,7 @@ def collect_episode(
         # 2·1  flatten dialogue ↦ input_ids
         ctx_txt = "".join(f"<|{m['role']}|>{m['content']}" for m in history)
         ctx_ids = tokenizer(ctx_txt, return_tensors="pt",
-                            truncation=True, max_length=10000, padding=False).input_ids.to(device)
+                            truncation=True, max_length=10000, padding=False)
         ctx_ids = {k: v.to(device) for k, v in ctx_ids.items()}
 
         # 2·2  model generates next assistant turn
@@ -81,10 +81,10 @@ def collect_episode(
 
     prompt_ids     = tokenizer(prompt_txt,
                                truncation=True, max_length=10000,
-                               add_special_tokens=False).input_ids
+                               add_special_tokens=False).to(device)
     completion_ids = tokenizer(completion_txt,
                                truncation=True, max_length=10000,
-                               add_special_tokens=False).input_ids
+                               add_special_tokens=False).to(device)
 
     return {
         "prompt_ids":     torch.tensor(prompt_ids,     dtype=torch.long),
