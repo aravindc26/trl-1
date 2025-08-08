@@ -31,13 +31,16 @@ def collect_episode(
         tokenizer.pad_token_id = tokenizer.eos_token_id
         model.config.pad_token_id = tokenizer.pad_token_id
 
+    context_budget = min(getattr(model.config, "max_position_embeddings", 4096) - 64, 2048)
+    tokenizer.truncation_side = "left"  # keep the most recent turns
+
     history = env.reset(init_prompt)
 
     for _ in range(max_turns):
         # 2·1  flatten dialogue ↦ input_ids
         ctx_txt = "".join(f"<|{m['role']}|>{m['content']}" for m in history)
         ctx_ids = tokenizer(ctx_txt, return_tensors="pt",
-                            truncation=True, max_length=10000, padding=False)
+                            truncation=True, max_length=context_budget, padding=False)
         ctx_ids = {k: v.to(device) for k, v in ctx_ids.items()}
 
         was_gc = getattr(model, "is_gradient_checkpointing", False)
@@ -51,12 +54,14 @@ def collect_episode(
             out = model.generate(
                 input_ids=ctx_ids["input_ids"],
                 attention_mask=ctx_ids["attention_mask"],   # ← explicit mask
-                max_new_tokens=max_tokens,
+                max_new_tokens=min(max_tokens, 200),
                 do_sample=True,
                 top_p=0.9,
                 pad_token_id=tokenizer.pad_token_id,    # ← explicit pad id
                 eos_token_id=tokenizer.eos_token_id,
-                use_cache=False,                         # ← avoids checkpointing warn
+                return_dict_in_generate=False,
+                output_scores=False,
+                use_cache=True,                         # ← avoids checkpointing warn
             )
 
         if was_gc:
