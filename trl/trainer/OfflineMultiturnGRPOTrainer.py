@@ -9,6 +9,8 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
         inputs: Dict[str, Union[torch.Tensor, Any]],
         num_items_in_batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable()
         model.train()
 
         # move tensors to device
