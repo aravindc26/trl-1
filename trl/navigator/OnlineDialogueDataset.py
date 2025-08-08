@@ -25,21 +25,36 @@ def collect_episode(
     device: str = "cuda",
 ) -> Dict[str, torch.Tensor]:
     print("collect_episode")
-    
+
+    if getattr(model, "config", None) is not None and getattr(model.config, "pad_token_id", None) is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        model.config.pad_token_id = tokenizer.pad_token_id
+
     history = env.reset(init_prompt)
 
     for _ in range(max_turns):
         # 2·1  flatten dialogue ↦ input_ids
         ctx_txt = "".join(f"<|{m['role']}|>{m['content']}" for m in history)
         ctx_ids = tokenizer(ctx_txt, return_tensors="pt",
-                            truncation=True, max_length=10000).input_ids.to(device)
+                            truncation=True, max_length=10000, padding=False).input_ids.to(device)
+        ctx_ids = {k: v.to(device) for k, v in ctx_ids.items()}
 
         # 2·2  model generates next assistant turn
         with torch.no_grad():
-            gen_ids = model.generate(
-                ctx_ids, max_new_tokens=max_tokens, do_sample=True, top_p=0.9
-            )[0][ctx_ids.shape[1]:]
-        assistant_msg = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            out = model.generate(
+                input_ids=ctx_ids["input_ids"],
+                attention_mask=ctx_ids["attention_mask"],   # ← explicit mask
+                max_new_tokens=max_tokens,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=tokenizer.pad_token_id,    # ← explicit pad id
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=False,                         # ← avoids checkpointing warn
+            )
+        # slice only newly generated tokens
+        reply_ids = out[0][ctx_ids["input_ids"].shape[1]:]
+        assistant_msg = tokenizer.decode(reply_ids, skip_special_tokens=True)
 
         # 2·3  drive the environment
         cmd = parse_cmd(assistant_msg)
