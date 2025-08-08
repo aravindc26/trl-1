@@ -9,6 +9,7 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
         inputs: Dict[str, Union[torch.Tensor, Any]],
         num_items_in_batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        print("OfflineMultiTurnGRPOTrainer.training_step")
         model.config.use_cache = False
         model.gradient_checkpointing_enable()
         model.train()
@@ -60,6 +61,26 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
                 return_outputs=False,
                 num_items_in_batch=num_items_in_batch,   # just pass it through
             )
+
+        # compute these however your training_step has them
+        mean_reward = self.accelerator.gather_for_metrics(inputs["rewards"]).float().mean().item()
+        mean_len    = self.accelerator.gather_for_metrics(inputs["completion_mask"].sum(1)).float().mean().item()
+
+        # If you computed per-token KL (or you rely on compute_loss to do it and stash it),
+        # you can log it too. Otherwise skip.
+        maybe_kl = None
+        if "_metrics" in self.__dict__ and self._metrics.get("kl"):
+            maybe_kl = self._metrics["kl"][-1]   # last computed by compute_loss()
+
+        logs = {
+            "train/loss":    (loss.detach() * self.args.gradient_accumulation_steps).item(),
+            "train/reward":  mean_reward,
+            "train/length":  mean_len,
+        }
+        if maybe_kl is not None:
+            logs["train/kl"] = maybe_kl
+
+        self.log(logs)           # <-- this is what ends up in W&B
 
         if self.args.n_gpu > 1:
             loss = loss.mean()
