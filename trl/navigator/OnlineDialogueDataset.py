@@ -81,15 +81,15 @@ def collect_episode(
 
     prompt_ids     = tokenizer(prompt_txt,
                                truncation=True, max_length=10000,
-                               add_special_tokens=False).to(device)
+                               add_special_tokens=False, return_tensors="pt").input_ids.squeeze(0).to(device)
     completion_ids = tokenizer(completion_txt,
                                truncation=True, max_length=10000,
-                               add_special_tokens=False).to(device)
+                               add_special_tokens=False, return_tensors="pt").input_ids.squeeze(0).to(device)
 
     return {
-        "prompt_ids":     torch.tensor(prompt_ids,     dtype=torch.long),
-        "completion_ids": torch.tensor(completion_ids, dtype=torch.long),
-        "rewards":        torch.tensor(reward,         dtype=torch.float),
+        "prompt_ids":     prompt_ids,
+        "completion_ids": completion_ids,
+        "rewards":        torch.tensor(reward, dtype=torch.float, device=device),
     }
 
 class OnlineDialogueDataset(IterableDataset):
