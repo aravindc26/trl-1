@@ -24,7 +24,8 @@ def collect_episode(
     max_tokens: int = 128,
     device: str = "cuda",
 ) -> Dict[str, torch.Tensor]:
-
+    print("collect_episode")
+    
     history = env.reset(init_prompt)
 
     for _ in range(max_turns):
