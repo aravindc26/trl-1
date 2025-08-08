@@ -40,6 +40,12 @@ def collect_episode(
                             truncation=True, max_length=10000, padding=False)
         ctx_ids = {k: v.to(device) for k, v in ctx_ids.items()}
 
+        was_gc = getattr(model, "is_gradient_checkpointing", False)
+        if was_gc:
+            model.gradient_checkpointing_disable()
+            old_use_cache = getattr(model.config, "use_cache", True)
+            model.config.use_cache = True
+
         # 2·2  model generates next assistant turn
         with torch.no_grad():
             out = model.generate(
@@ -52,6 +58,11 @@ def collect_episode(
                 eos_token_id=tokenizer.eos_token_id,
                 use_cache=False,                         # ← avoids checkpointing warn
             )
+
+        if was_gc:
+            model.gradient_checkpointing_enable()
+            model.config.use_cache = old_use_cache
+
         # slice only newly generated tokens
         reply_ids = out[0][ctx_ids["input_ids"].shape[1]:]
         assistant_msg = tokenizer.decode(reply_ids, skip_special_tokens=True)
