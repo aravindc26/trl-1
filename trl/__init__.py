@@ -49,7 +49,7 @@ _import_structure = {
         "create_reference_model",
         "setup_chat_format",
     ],
-    "navigator": ["Neo4jKGEnv", "OnlineDialogueDataset", "make_dataloader"],
+    "navigator": ["Neo4jKGEnv", "OnlineDialogueDataset", "make_dataloader", "make_collate_fn"],
     "trainer": [
         "AlignPropConfig",
         "AlignPropTrainer",
@@ -149,7 +149,7 @@ if TYPE_CHECKING:
         create_reference_model,
         setup_chat_format,
     )
-    from .navigator import Neo4jKGEnv, OnlineDialogueDataset, make_dataloader
+    from .navigator import Neo4jKGEnv, OnlineDialogueDataset, make_dataloader, make_collate_fn
     from .scripts import ScriptArguments, TrlParser, init_zero_verbose
     from .trainer import (
         AlignPropConfig,
