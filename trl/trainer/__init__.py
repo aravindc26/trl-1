@@ -38,7 +38,7 @@ _import_structure = {
     "gkd_trainer": ["GKDTrainer"],
     "grpo_config": ["GRPOConfig"],
     "grpo_trainer": ["GRPOTrainer"],
-    "offline_multi_turn_grpo_trainer": ["OfflineMultiTurnGRPOTrainer"],
+    "OfflineMultiturnGRPOTrainer": ["OfflineMultiTurnGRPOTrainer"],
     "iterative_sft_trainer": ["IterativeSFTTrainer"],
     "judges": [
         "AllTrueJudge",
@@ -110,7 +110,7 @@ if TYPE_CHECKING:
     from .gkd_trainer import GKDTrainer
     from .grpo_config import GRPOConfig
     from .grpo_trainer import GRPOTrainer
-    from .offline_multi_turn_grpo_trainer import OfflineMultiTurnGRPOTrainer
+    from .OfflineMultiturnGRPOTrainer import OfflineMultiTurnGRPOTrainer
     from .iterative_sft_trainer import IterativeSFTTrainer
     from .judges import (
         AllTrueJudge,
