@@ -1,5 +1,6 @@
 from trl import GRPOTrainer
 import torch
+from typing_extensions import Dict, Any, Optional, Union
 
 class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
     def training_step(
