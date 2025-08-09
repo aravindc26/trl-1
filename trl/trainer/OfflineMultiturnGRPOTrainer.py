@@ -99,7 +99,7 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
                 ref_logps = self._per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
         # advantages from your external rewards
-        rewards = inputs.pop("rewards").view(-1).to(input_ids)
+        rewards = inputs.pop("rewards").view(-1).to(device=input_ids.device)
         advantages = rewards - rewards.mean()
 
         # hand off to TRL's GRPO loss
