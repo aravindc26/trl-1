@@ -112,11 +112,7 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
             "advantages": advantages,
         })
 
-        # compatible context manager name across versions
-        ctx = getattr(self, "compute_loss_context_manager",
-                      getattr(self, "compute_loss_context"))
-
-        with ctx():
+        with self.compute_loss_context_manager():
             loss = super().compute_loss(
                 model,
                 inputs,
