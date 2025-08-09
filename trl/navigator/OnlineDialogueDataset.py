@@ -158,15 +158,14 @@ def make_collate_fn(tokenizer):
         p_max = max(len(b["prompt_ids"])     for b in batch)
         c_max = max(len(b["completion_ids"]) for b in batch)
         for b in batch:
-            b["prompt_ids"]     = F.pad(
-                b["prompt_ids"], (p_max - len(b["prompt_ids"]), 0), value=pad_id)
-            b["completion_ids"] = F.pad(
-                b["completion_ids"], (0, c_max - len(b["completion_ids"])), value=pad_id)
-        out = {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
+            b["prompt_ids"]     = torch.nn.functional.pad(b["prompt_ids"][:p_max],     (p_max - len(b["prompt_ids"]), 0), value=pad_id)
+            b["completion_ids"] = torch.nn.functional.pad(b["completion_ids"][:c_max], (0, c_max - len(b["completion_ids"])), value=pad_id)
+        out = {k: torch.stack([b[k].cpu() if torch.is_tensor(b[k]) else b[k] for b in batch]) for k in batch[0]}
         out["prompt_mask"]     = (out["prompt_ids"]     != pad_id).long()
         out["completion_mask"] = (out["completion_ids"] != pad_id).long()
         return out
     return collate
+
 
 def make_dataloader(
     model,

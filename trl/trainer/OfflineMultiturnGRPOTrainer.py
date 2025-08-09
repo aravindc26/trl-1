@@ -1,56 +1,56 @@
-from trl import GRPOTrainer
+from typing import Any, Dict, List, Optional, Union
 import torch
-from typing_extensions import Dict, Any, Optional, Union, List
+from trl import GRPOTrainer
 
 class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
     def training_step(
         self,
-        model,
+        model: torch.nn.Module,
         inputs: Union[Dict[str, Any], List[Dict[str, Any]]],
         num_items_in_batch: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
     ) -> torch.Tensor:
+        # Handle list-of-microbatches or single dict
         if isinstance(inputs, list):
-            # normalize num_items_in_batch
             if isinstance(num_items_in_batch, torch.Tensor):
-                nib_list = [num_items_in_batch] * len(inputs)
+                nibl = [num_items_in_batch] * len(inputs)
             elif isinstance(num_items_in_batch, list):
-                nib_list = num_items_in_batch
+                nibl = num_items_in_batch
             else:
-                nib_list = [None] * len(inputs)
-
-            losses = []
-            for mb, nib in zip(inputs, nib_list):
-                losses.append(self._training_step_one(model, mb, nib))
+                nibl = [None] * len(inputs)
+            losses = [self._training_step_one(model, mb, nib) for mb, nib in zip(inputs, nibl)]
             return sum(losses) / len(losses)
-
         return self._training_step_one(model, inputs, num_items_in_batch)
 
     def _training_step_one(
         self,
         model: torch.nn.Module,
-        inputs: Dict[str, Union[torch.Tensor, Any]],
+        inputs: Dict[str, Any],
         num_items_in_batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        print("OfflineMultiTurnGRPOTrainer.training_step")
-        model.config.use_cache = False
-        model.gradient_checkpointing_enable()
         model.train()
 
-        # move tensors to device
+        # move to device
         for k, v in list(inputs.items()):
             if torch.is_tensor(v):
                 inputs[k] = v.to(self.args.device)
 
-        # build full sequence + attention
-        prompt_ids, completion_ids = inputs["prompt_ids"], inputs["completion_ids"]
-        prompt_mask = inputs.get("prompt_mask") or (prompt_ids != self.tokenizer.pad_token_id).long()
-        completion_mask = inputs.get("completion_mask") or (completion_ids != self.tokenizer.pad_token_id).long()
+        # fetch & ensure [B, L] tensors even when batch=1
+        prompt_ids     = inputs["prompt_ids"];      completion_ids  = inputs["completion_ids"]
+        if prompt_ids.dim() == 1:     prompt_ids = prompt_ids.unsqueeze(0)
+        if completion_ids.dim() == 1: completion_ids = completion_ids.unsqueeze(0)
+
+        prompt_mask     = inputs.get("prompt_mask")
+        completion_mask = inputs.get("completion_mask")
+        if prompt_mask is None:                prompt_mask = (prompt_ids != self.tokenizer.pad_token_id).long()
+        elif prompt_mask.dim() == 1:           prompt_mask = prompt_mask.unsqueeze(0)
+        if completion_mask is None:            completion_mask = (completion_ids != self.tokenizer.pad_token_id).long()
+        elif completion_mask.dim() == 1:       completion_mask = completion_mask.unsqueeze(0)
 
         input_ids      = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)
 
-        # reference per-token logps (handles reference-free LoRA too)
+        # reference per-token logps (matches TRL behavior)
         if getattr(self, "ref_model", None) is not None:
             with torch.no_grad():
                 ref_logps = self._get_per_token_logps(self.ref_model, input_ids, attention_mask, logits_to_keep)
@@ -58,11 +58,11 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
             with self.accelerator.unwrap_model(model).disable_adapter(), torch.no_grad():
                 ref_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
-        # advantages from your external rewards
+        # advantages from external reward
         rewards = inputs.pop("rewards").view(-1).to(input_ids)
         advantages = rewards - rewards.mean()
 
-        # hand off to TRL's GRPO loss
+        # hand off to TRL's compute_loss (keeps KL/masking right)
         inputs.update({
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -72,37 +72,12 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
             "advantages": advantages,
         })
 
-        # compatible context manager name across versions
         ctx = getattr(self, "compute_loss_context_manager",
                       getattr(self, "compute_loss_context"))
-
         with ctx():
             loss = super().compute_loss(
-                model,
-                inputs,
-                return_outputs=False,
-                num_items_in_batch=num_items_in_batch,   # just pass it through
+                model, inputs, return_outputs=False, num_items_in_batch=num_items_in_batch
             )
-
-        # compute these however your training_step has them
-        mean_reward = self.accelerator.gather_for_metrics(inputs["rewards"]).float().mean().item()
-        mean_len    = self.accelerator.gather_for_metrics(inputs["completion_mask"].sum(1)).float().mean().item()
-
-        # If you computed per-token KL (or you rely on compute_loss to do it and stash it),
-        # you can log it too. Otherwise skip.
-        maybe_kl = None
-        if "_metrics" in self.__dict__ and self._metrics.get("kl"):
-            maybe_kl = self._metrics["kl"][-1]   # last computed by compute_loss()
-
-        logs = {
-            "train/loss":    (loss.detach() * self.args.gradient_accumulation_steps).item(),
-            "train/reward":  mean_reward,
-            "train/length":  mean_len,
-        }
-        if maybe_kl is not None:
-            logs["train/kl"] = maybe_kl
-
-        self.log(logs)           # <-- this is what ends up in W&B
 
         if self.args.n_gpu > 1:
             loss = loss.mean()
