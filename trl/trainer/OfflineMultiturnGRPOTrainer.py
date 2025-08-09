@@ -3,6 +3,30 @@ import torch
 from typing_extensions import Dict, Any, Optional, Union, List
 
 class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
+    # inside OfflineMultiTurnGRPOTrainer
+    def _per_token_logps(
+        self,
+        model,
+        input_ids: torch.Tensor,          # [B, T]
+        attention_mask: torch.Tensor,     # [B, T]
+        logits_to_keep: int,              # C (completion length)
+    ) -> torch.Tensor:                    # returns [B, C]
+        # forward
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits  # [B, T, V]
+
+        # causal shift: logits[t] predicts token at labels[t]
+        logits = logits[:, :-1, :]                         # [B, T-1, V]
+        labels = input_ids[:, 1:]                          # [B, T-1]
+
+        # keep only the tail corresponding to the completion tokens
+        if logits_to_keep > 0:
+            logits = logits[:, -logits_to_keep:, :]        # [B, C, V]
+            labels = labels[:, -logits_to_keep:]           # [B, C]
+
+        logps = torch.log_softmax(logits, dim=-1)          # [B, C, V]
+        tok_logps = logps.gather(-1, labels.unsqueeze(-1)).squeeze(-1)  # [B, C]
+        return tok_logps
+
     def training_step(
         self,
         model,
@@ -25,7 +49,7 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
 
         return self._training_step_one(model, inputs, num_items_in_batch)
 
-    def training_step_one(
+    def _training_step_one(
         self,
         model: torch.nn.Module,
         inputs: Dict[str, Union[torch.Tensor, Any]],
@@ -69,10 +93,10 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
         # reference per-token logps (handles reference-free LoRA too)
         if getattr(self, "ref_model", None) is not None:
             with torch.no_grad():
-                ref_logps = self._get_per_token_logps(self.ref_model, input_ids, attention_mask, logits_to_keep)
+                ref_logps = self._per_token_logps(self.ref_model, input_ids, attention_mask, logits_to_keep)
         else:
             with self.accelerator.unwrap_model(model).disable_adapter(), torch.no_grad():
-                ref_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+                ref_logps = self._per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
         # advantages from your external rewards
         rewards = inputs.pop("rewards").view(-1).to(input_ids)
