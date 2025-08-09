@@ -1,9 +1,31 @@
 from trl import GRPOTrainer
 import torch
-from typing_extensions import Dict, Any, Optional, Union
+from typing_extensions import Dict, Any, Optional, Union, List
 
 class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
     def training_step(
+        self,
+        model,
+        inputs: Union[Dict[str, Any], List[Dict[str, Any]]],
+        num_items_in_batch: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+    ) -> torch.Tensor:
+        if isinstance(inputs, list):
+            # normalize num_items_in_batch
+            if isinstance(num_items_in_batch, torch.Tensor):
+                nib_list = [num_items_in_batch] * len(inputs)
+            elif isinstance(num_items_in_batch, list):
+                nib_list = num_items_in_batch
+            else:
+                nib_list = [None] * len(inputs)
+
+            losses = []
+            for mb, nib in zip(inputs, nib_list):
+                losses.append(self._training_step_one(model, mb, nib))
+            return sum(losses) / len(losses)
+
+        return self._training_step_one(model, inputs, num_items_in_batch)
+
+    def training_step_one(
         self,
         model: torch.nn.Module,
         inputs: Dict[str, Union[torch.Tensor, Any]],
