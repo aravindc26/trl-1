@@ -67,80 +67,79 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
 
         # build full sequence + attention
         prompt_ids, completion_ids = inputs["prompt_ids"], inputs["completion_ids"]
-        # 👇 Ensure [B, L] even when batch size == 1 or uncollated input sneaks in
-        if prompt_ids.dim() == 1:
-            prompt_ids = prompt_ids.unsqueeze(0)
-        if completion_ids.dim() == 1:
-            completion_ids = completion_ids.unsqueeze(0)
-        
-        prompt_mask = inputs.get("prompt_mask")
+        if prompt_ids.dim() == 1:     prompt_ids = prompt_ids.unsqueeze(0)
+        if completion_ids.dim() == 1: completion_ids = completion_ids.unsqueeze(0)
+
+        prompt_mask     = inputs.get("prompt_mask")
         completion_mask = inputs.get("completion_mask")
-
-        if prompt_mask is None:
-            prompt_mask = (prompt_ids != self.tokenizer.pad_token_id).long()
-        elif prompt_mask.dim() == 1:
-            prompt_mask = prompt_mask.unsqueeze(0)
-
-        if completion_mask is None:
-            completion_mask = (completion_ids != self.tokenizer.pad_token_id).long()
-        elif completion_mask.dim() == 1:
-            completion_mask = completion_mask.unsqueeze(0)
+        if prompt_mask is None:                prompt_mask = (prompt_ids != self.tokenizer.pad_token_id).long()
+        elif prompt_mask.dim() == 1:           prompt_mask = prompt_mask.unsqueeze(0)
+        if completion_mask is None:            completion_mask = (completion_ids != self.tokenizer.pad_token_id).long()
+        elif completion_mask.dim() == 1:       completion_mask = completion_mask.unsqueeze(0)
 
         input_ids      = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)
 
-        # reference per-token logps (handles reference-free LoRA too)
+        # reference per-token logps (handles ref-free LoRA too)
         if getattr(self, "ref_model", None) is not None:
             with torch.no_grad():
-                ref_logps = self._per_token_logps(self.ref_model, input_ids, attention_mask, logits_to_keep)
+                ref_logps = self._per_token_logps(self.ref_model, input_ids, attention_mask, logits_to_keep)  # [B,C]
         else:
             with self.accelerator.unwrap_model(model).disable_adapter(), torch.no_grad():
-                ref_logps = self._per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+                ref_logps = self._per_token_logps(model, input_ids, attention_mask, logits_to_keep)            # [B,C]
 
-        # advantages from your external rewards
-        rewards = inputs.pop("rewards").view(-1).to(device=input_ids.device)
-        advantages = rewards - rewards.mean()
+        # rewards → float on correct device; keep a copy for logging
+        rewards = inputs.pop("rewards").view(-1).to(device=input_ids.device, dtype=torch.float32)  # [B]
+        rewards_for_logging = rewards.detach()
+        advantages = rewards - rewards.mean()                                  # [B]
+        advantages = advantages.unsqueeze(1)                                    # [B,1]
 
-        # hand off to TRL's GRPO loss
-        inputs.update({
-            "prompt_ids": prompt_ids,
-            "prompt_mask": prompt_mask,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
-            "ref_per_token_logps": ref_logps,
-            "advantages": advantages,
-        })
-
+        # ── MANUAL GRPO LOSS (offline) ───────────────────────────────────────
         with self.compute_loss_context_manager():
-            loss = super().compute_loss(
-                model,
-                inputs,
-                return_outputs=False,
-                num_items_in_batch=num_items_in_batch,   # just pass it through
-            )
+            policy_logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits  # [B,T,V]
 
-        # compute these however your training_step has them
-        mean_reward = self.accelerator.gather_for_metrics(inputs["rewards"]).float().mean().item()
-        mean_len    = self.accelerator.gather_for_metrics(inputs["completion_mask"].sum(1)).float().mean().item()
+        # causal shift
+        logits_shifted = policy_logits[:, :-1, :]         # [B,T-1,V]
+        labels_shifted = input_ids[:, 1:]                 # [B,T-1]
 
-        # If you computed per-token KL (or you rely on compute_loss to do it and stash it),
-        # you can log it too. Otherwise skip.
-        maybe_kl = None
-        if "_metrics" in self.__dict__ and self._metrics.get("kl"):
-            maybe_kl = self._metrics["kl"][-1]   # last computed by compute_loss()
+        # slice positions that predict completion tokens
+        resp_start = prompt_ids.size(1)
+        C = completion_ids.size(1)
+        rng = slice(resp_start - 1, resp_start - 1 + C)   # predicts tokens at resp_start..resp_start+C-1
 
+        pol_logps = torch.log_softmax(logits_shifted[:, rng, :], dim=-1)         # [B,C,V]
+        tgt_ids   = labels_shifted[:, rng].unsqueeze(-1)                          # [B,C,1]
+        pol_tok_logp = pol_logps.gather(-1, tgt_ids).squeeze(-1)                  # [B,C]
+
+        # forward-KL term q||p with ref_logps already computed
+        delta = ref_logps - pol_tok_logp                                          # [B,C]
+        per_token_kl = torch.exp(delta) - delta - 1.0                             # [B,C]
+
+        # exp-trick keeps gradient on policy logp
+        policy_term = torch.exp(pol_tok_logp - pol_tok_logp.detach()) * advantages  # [B,C]
+
+        beta = getattr(self, "beta", 0.05)
+        per_token_loss = -(policy_term - beta * per_token_kl)                     # [B,C]
+
+        # mask padding; average per sample then per batch
+        valid = completion_mask.float()                                           # [B,C]
+        loss_per_sample = (per_token_loss * valid).sum(1) / (valid.sum(1) + 1e-8) # [B]
+        loss = loss_per_sample.mean()
+
+        # ── logging ───────────────────────────────────────────────────────────
+        mean_reward = self.accelerator.gather_for_metrics(rewards_for_logging).float().mean().item()
+        mean_len    = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         logs = {
-            "train/loss":    (loss.detach() * self.args.gradient_accumulation_steps).item(),
-            "train/reward":  mean_reward,
-            "train/length":  mean_len,
+            "train/loss":   (loss.detach() * self.args.gradient_accumulation_steps).item(),
+            "train/reward": mean_reward,
+            "train/length": mean_len,
         }
-        if maybe_kl is not None:
-            logs["train/kl"] = maybe_kl
+        self.log(logs)
 
-        self.log(logs)           # <-- this is what ends up in W&B
-
+        # backward + scale for grad accumulation
         if self.args.n_gpu > 1:
             loss = loss.mean()
         self.accelerator.backward(loss)
         return loss.detach() / self.args.gradient_accumulation_steps
+
