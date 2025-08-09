@@ -25,7 +25,7 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
 
         return self._training_step_one(model, inputs, num_items_in_batch)
 
-    def training_step_one(
+    def _training_step_one(
         self,
         model: torch.nn.Module,
         inputs: Dict[str, Union[torch.Tensor, Any]],
