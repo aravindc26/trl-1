@@ -73,7 +73,9 @@ def collect_episode(
         reply_ids = out[0][prompt_lens[0]:]
         assistant_msg = tokenizer.decode(reply_ids, skip_special_tokens=True)
         print("assistant_msg", assistant_msg)
-
+        print("full", tokenizer.decode(out[0], skip_special_tokens=True))
+        print("prompt len", prompt_lens[0])
+        
         # 2·3  drive the environment
         cmd = parse_cmd(assistant_msg)
         if cmd["action"] == "navigate":
