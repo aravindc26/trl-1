@@ -2,9 +2,20 @@ import torch, random, re
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from typing import List, Dict, Any, Callable
+from transformers import StoppingCriteria, StoppingCriteriaList
 
 _NAV = re.compile(r'^navigate\(([A-Za-z0-9_\-\/.#]+)\)$')
 _STOP = re.compile(r"stop\s*\(\s*\)", re.I)
+
+class StopAtTurn(StoppingCriteria):
+    def __init__(self, stop_tokens):
+        self.stop_tokens = stop_tokens
+
+    def __call__(self, input_ids, scores):
+        last_token = input_ids[0, -1].item()
+        return last_token in self.stop_tokens
+
+# In generate:
 
 def parse_cmd(text: str) -> Dict[str, Any]:
     if _STOP.match(text.strip()):
@@ -36,6 +47,10 @@ def collect_episode(
 
     history = env.reset(init_prompt)
 
+    stop_tokens = tokenizer.convert_tokens_to_ids(["<|assistant|>", "<|user|>", "\n"])  # Adjust based on your tokenizer
+    stopping_criteria = StoppingCriteriaList([StopAtTurn(stop_tokens)])
+
+
     for _ in range(max_turns):
         # 2·1  flatten dialogue ↦ input_ids
         ctx_txt = "".join(f"<|{m['role']}|>{m['content']}" for m in history)
@@ -55,7 +70,7 @@ def collect_episode(
             out = model.generate(
                 input_ids=ctx_ids["input_ids"],
                 attention_mask=ctx_ids["attention_mask"],   # ← explicit mask
-                max_new_tokens=min(max_tokens, 200),
+                max_new_tokens=max_tokens,
                 do_sample=True,
                 top_p=0.9,
                 pad_token_id=tokenizer.pad_token_id,    # ← explicit pad id
@@ -63,6 +78,7 @@ def collect_episode(
                 return_dict_in_generate=False,
                 output_scores=False,
                 use_cache=True,                         # ← avoids checkpointing warn
+                stopping_criteria=stopping_criteria,
             )
 
         if was_gc:
