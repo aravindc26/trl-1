@@ -71,6 +71,7 @@ def collect_episode(
         # slice only newly generated tokens
         reply_ids = out[0][ctx_ids["input_ids"].shape[1]:]
         assistant_msg = tokenizer.decode(reply_ids, skip_special_tokens=True)
+        print("assistant_msg", assistant_msg)
 
         # 2·3  drive the environment
         cmd = parse_cmd(assistant_msg)
