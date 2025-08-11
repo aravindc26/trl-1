@@ -39,6 +39,7 @@ def collect_episode(
     for _ in range(max_turns):
         # 2·1  flatten dialogue ↦ input_ids
         ctx_txt = "".join(f"<|{m['role']}|>{m['content']}" for m in history)
+        ctx_txt += "\n<|assistant|>"
         ctx_ids = tokenizer(ctx_txt, return_tensors="pt",
                             truncation=True, max_length=context_budget, padding=False)
         ctx_ids = {k: v.to(device) for k, v in ctx_ids.items()}
@@ -75,7 +76,7 @@ def collect_episode(
         print("assistant_msg", assistant_msg)
         print("full", tokenizer.decode(out[0], skip_special_tokens=True))
         print("prompt len", prompt_lens[0])
-        
+
         # 2·3  drive the environment
         cmd = parse_cmd(assistant_msg)
         if cmd["action"] == "navigate":
@@ -96,7 +97,7 @@ def collect_episode(
     reward = reward_fn(init_prompt, env.trajectory, env.history, env.cache)
 
     prompt_txt = "".join(f"<|{m['role']}|>{m['content']}"
-                         for m in env.history[:-2])          # up to last user msg
+                         for m in env.history[:-2]) + "\n<|assistant|>"         # up to last user msg
     completion_txt = env.history[-2]["content"]              # last assistant msg
 
     prompt_ids     = tokenizer(prompt_txt,
