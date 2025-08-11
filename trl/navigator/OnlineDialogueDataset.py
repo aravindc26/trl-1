@@ -68,8 +68,9 @@ def collect_episode(
             model.gradient_checkpointing_enable()
             model.config.use_cache = old_use_cache
 
+        prompt_lens = ctx_ids["attention_mask"].sum(dim=1)
         # slice only newly generated tokens
-        reply_ids = out[0][ctx_ids["input_ids"].shape[1]:]
+        reply_ids = out[0][prompt_lens[0]:]
         assistant_msg = tokenizer.decode(reply_ids, skip_special_tokens=True)
         print("assistant_msg", assistant_msg)
 
