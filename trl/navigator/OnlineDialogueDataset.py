@@ -18,6 +18,7 @@ class StopAtTurn(StoppingCriteria):
 # In generate:
 
 def parse_cmd(text: str) -> Dict[str, Any]:
+    text = text.split("</think>")[-1]
     if _STOP.match(text.strip()):
         return {"action": "stop"}
     m = _NAV.match(text.strip())
