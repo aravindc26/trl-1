@@ -40,8 +40,8 @@ def collect_episode(
     actions = []
     for _ in range(max_turns):
         # 2·1  flatten dialogue ↦ input_ids
-        ctx_txt = "".join(f"1{m['role']}\n{m['content']}\n"
-        ctx_txt += "1assistant\n"
+        ctx_txt = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in history)
+        ctx_txt += "<|im_start|>assistant\n"
         ctx_ids = tokenizer(ctx_txt, return_tensors="pt",
                             truncation=True, max_length=context_budget, padding=False)
         ctx_ids = {k: v.to(device) for k, v in ctx_ids.items()}
