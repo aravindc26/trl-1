@@ -37,11 +37,11 @@ def collect_episode(
     tokenizer.truncation_side = "left"  # keep the most recent turns
 
     history = env.reset(init_prompt)
-
+    actions = []
     for _ in range(max_turns):
         # 2·1  flatten dialogue ↦ input_ids
-        ctx_txt = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in history)
-        ctx_txt += "<|im_start|>assistant\n"
+        ctx_txt = "".join(f"1{m['role']}\n{m['content']}\n"
+        ctx_txt += "1assistant\n"
         ctx_ids = tokenizer(ctx_txt, return_tensors="pt",
                             truncation=True, max_length=context_budget, padding=False)
         ctx_ids = {k: v.to(device) for k, v in ctx_ids.items()}
@@ -82,10 +82,13 @@ def collect_episode(
         # 2·3  drive the environment
         cmd = parse_cmd(assistant_msg)
         if cmd["action"] == "navigate":
+            actions.append(assistant_msg)
             obs, done = env.navigate(cmd["id"])
         elif cmd["action"] == "stop":
+            actions.append(assistant_msg)
             obs, done = env.stop()
         else:
+            actions.append(assistant_msg)
             env.trajectory.append("__FAILED__")
             obs, done = "Invalid command", True
             history.extend([
@@ -97,7 +100,7 @@ def collect_episode(
             break
 
     # 2·4  external reward & tensors
-    reward = reward_fn(init_prompt, env.trajectory, env.history, env.cache)
+    reward = reward_fn(init_prompt, env.trajectory, env.history, env.cache, actions)
 
     prompt_txt = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
                          for m in env.history[:-2]) + "<|im_start|>assistant\n"         # up to last user msg
