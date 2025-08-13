@@ -56,6 +56,9 @@ class OfflineMultiTurnGRPOTrainer(GRPOTrainer):
         num_items_in_batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         print("OfflineMultiTurnGRPOTrainer.training_step")
+        print("inputs", inputs)
+        print("inputs length", len(inputs))
+        print("num_items_in_batch", num_items_in_batch)
         model.config.use_cache = False
         model.gradient_checkpointing_enable()
         model.train()
