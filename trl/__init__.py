@@ -49,6 +49,7 @@ _import_structure = {
         "create_reference_model",
         "setup_chat_format",
     ],
+    "navigator": ["Neo4jKGEnv"],
     "trainer": [
         "AlignPropConfig",
         "AlignPropTrainer",
@@ -69,6 +70,8 @@ _import_structure = {
         "GKDConfig",
         "GKDTrainer",
         "GRPOConfig",
+        "MultiTurnGRPOConfig",
+        "MultiTurnGRPOTrainer",
         "GRPOTrainer",
         "HfPairwiseJudge",
         "IterativeSFTTrainer",
@@ -149,6 +152,7 @@ if TYPE_CHECKING:
         setup_chat_format,
     )
     from .scripts import ScriptArguments, TrlParser, init_zero_verbose
+    from .navigator import Neo4jKGEnv
     from .trainer import (
         AlignPropConfig,
         AlignPropTrainer,
@@ -169,7 +173,9 @@ if TYPE_CHECKING:
         GKDConfig,
         GKDTrainer,
         GRPOConfig,
+        MultiTurnGRPOConfig,
         GRPOTrainer,
+        MultiTurnGRPOTrainer,
         HfPairwiseJudge,
         IterativeSFTTrainer,
         KTOConfig,
