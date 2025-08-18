@@ -1,5 +1,6 @@
 from typing_extensions import Optional, Dict, Any, Type, TypeVar
 from dataclasses import field
+from ..trainer.grpo_config import GRPOConfig
 
 T = TypeVar("T")
 
