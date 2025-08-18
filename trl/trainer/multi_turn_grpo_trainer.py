@@ -47,19 +47,21 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
             turns += 1
             if turns >= self.args.max_turns:
                 break
-        return prompt_completion_ids, prompt_ids, prompt_mask, history
+        return prompt_completion_ids, prompt_ids, prompt_mask, history, env
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
-        prompt_completion_ids, prompt_ids, prompt_mask, histories = [], [], [], []
+        init_prompts = prompts
+        prompt_completion_ids, prompt_ids, prompt_mask, histories, envs = [], [], [], [], []
         for prompt in prompts:
             for _ in range(self.num_generations):
-                pc_ids, p_ids, p_mask, h = self._get_prompt_completion(prompt)
+                pc_ids, p_ids, p_mask, h, env = self._get_prompt_completion(prompt)
                 prompt_completion_ids.append(pc_ids)
                 prompt_ids.append(p_ids)
                 prompt_mask.append(p_mask)
                 histories.append(h)
+                envs.append(env)
         
         prompt_completion_ids = self._pad_and_stack_tensors(prompt_completion_ids, pad_value=self.processing_class.pad_token_id)
         prompt_ids = self._pad_and_stack_tensors(prompt_ids, pad_value=self.processing_class.pad_token_id)
@@ -120,7 +122,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
                     for example in inputs:
                         # Repeat each value in the column for `num_generations` times
                         reward_kwargs[key].extend([example[key]] * self.num_generations)
-                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                output_reward_func = reward_func(prompts=prompts, completions=completions, envs=envs, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
         # Sum the rewards from all reward functions
