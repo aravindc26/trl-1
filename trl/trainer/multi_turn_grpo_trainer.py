@@ -1,6 +1,6 @@
 from ..data_utils import apply_chat_template, is_conversational
 from ..models import unwrap_model_for_generation
-from typing import Union, Any
+from typing import Union, Any, List
 import torch
 from ..trainer.grpo_trainer import GRPOTrainer
 
