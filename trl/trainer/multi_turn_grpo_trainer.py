@@ -41,7 +41,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
             
-            completion = self.processing_class.decode(completion_ids, skip_special_tokens=True)
+            completion = self.processing_class.decode(completion_ids[0], skip_special_tokens=True)
             history = env.move(completion)
             turns += 1
             if turns >= self.args.max_turns:
