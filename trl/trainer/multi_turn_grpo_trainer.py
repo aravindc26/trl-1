@@ -51,6 +51,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
+        print(inputs)
         prompts = [x["prompt"] for x in inputs]
         prompt_completion_ids, prompt_ids, prompt_mask, histories, envs = [], [], [], [], []
         for prompt in prompts:
