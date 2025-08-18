@@ -56,6 +56,7 @@ class Neo4jKGEnv:
 
     def reset(self, initial_prompt: str):
         self.curr_node, self.reset_called = None, True
+        self.question = initial_prompt
 
         vec = self.embed_fn(initial_prompt)
 
