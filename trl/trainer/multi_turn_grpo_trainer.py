@@ -3,6 +3,7 @@ from ..models import unwrap_model_for_generation
 from typing import Union, Any, List
 import torch
 from ..trainer.grpo_trainer import GRPOTrainer
+import torch.nn as nn
 
 class MultiTurnGRPOTrainer(GRPOTrainer):
     def _pad_and_stack_tensors(self, tensor_list: List[torch.Tensor], pad_value: int) -> torch.Tensor:
