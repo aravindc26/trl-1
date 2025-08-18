@@ -20,9 +20,9 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         )
         return padded_tensors.to(self.accelerator.device)
 
-    def _get_prompt_completion(self, prompt):
+    def _get_prompt_completion(self, input):
         env = self.args.env_class(**self.args.env_init_kwargs)
-        history = env.reset(prompt)
+        history = env.reset(input["question"])
         turns = 0
         while not env.end():
             ctx_text = self.processing_class.apply_chat_template(history, tokenize=False, add_generation_prompt=True)
@@ -51,12 +51,10 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
-        print(inputs)
-        prompts = [x["prompt"] for x in inputs]
         prompt_completion_ids, prompt_ids, prompt_mask, histories, envs = [], [], [], [], []
-        for prompt in prompts:
+        for input in inputs:
             for _ in range(self.num_generations):
-                pc_ids, p_ids, p_mask, h, env = self._get_prompt_completion(prompt)
+                pc_ids, p_ids, p_mask, h, env = self._get_prompt_completion(input)
                 prompt_completion_ids.append(pc_ids)
                 prompt_ids.append(p_ids)
                 prompt_mask.append(p_mask)
