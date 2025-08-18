@@ -25,10 +25,10 @@ class Neo4jKGEnv:
         self.end = False
         self.history, self.trajectory, self.cache, self.actions = [], [], {}, []
 
-    _NAV = re.compile(r'^navigate\(([A-Za-z0-9_\-\/.#]+)\)$')
-    _STOP = re.compile(r"stop\s*\(\s*\)", re.I)
-
     def parse_cmd(self, text: str) -> Dict[str, Any]:
+        _NAV = re.compile(r'^navigate\(([A-Za-z0-9_\-\/.#]+)\)$')
+        _STOP = re.compile(r"stop\s*\(\s*\)", re.I)
+
         text = text.split("</think>")[-1]
         if _STOP.match(text.strip()):
             self.actions.append(text.strip())
