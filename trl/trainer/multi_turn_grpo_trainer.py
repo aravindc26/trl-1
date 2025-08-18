@@ -2,6 +2,7 @@ from ..data_utils import apply_chat_template, is_conversational
 from ..models import unwrap_model_for_generation
 from typing import Union, Any
 import torch
+from ..trainer.grpo_trainer import GRPOTrainer
 
 class MultiTurnGRPOTrainer(GRPOTrainer):
     def _pad_and_stack_tensors(self, tensor_list: List[torch.Tensor], pad_value: int) -> torch.Tensor:
