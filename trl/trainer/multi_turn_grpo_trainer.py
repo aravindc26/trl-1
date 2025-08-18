@@ -24,7 +24,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         env = self.args.env_class(**self.args.env_init_kwargs)
         history = env.reset(input["question"])
         turns = 0
-        while not env.end():
+        while not env.ended():
             ctx_text = self.processing_class.apply_chat_template(history, tokenize=False, add_generation_prompt=True)
             ctx_ids = self.processing_class(ctx_text, return_tensors="pt", max_length=self.max_prompt_length, 
                 padding=True, padding_side="left", add_special_tokens=False).input_ids

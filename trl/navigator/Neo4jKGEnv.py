@@ -40,7 +40,7 @@ class Neo4jKGEnv:
         self.actions.append(text.strip())
         return {"action": "invalid"}
 
-    def end(self):
+    def ended(self):
         return self.end
 
     def move(self, action: str):
