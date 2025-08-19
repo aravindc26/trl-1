@@ -48,8 +48,15 @@ class Neo4jKGEnv:
         if cmd["action"] == "stop":
             self.end = True
             self.stop()
+            self.history += [{"role":"assistant","content":action}]
         elif cmd["action"] == "navigate":
-            self.navigate(cmd["id"])
+            obs, done = self.navigate(cmd["id"])
+            if done:
+                self.end = True
+                self.history += [{"role":"assistant","content":action}]
+            else:
+                self.history += [{"role":"assistant","content":action},
+                         {"role":"user","content":obs}]
         else:
             self.end = True
         return self.history
@@ -136,8 +143,6 @@ You have following options available, as response:
                     f"Neighbours: {nbs}")
             self.cache[node_id] = details
             done = False
-        self.history += [{"role":"assistant","content":f"navigate({node_id})"},
-                         {"role":"user","content":obs}]
         return obs, done
 
     def stop(self):
