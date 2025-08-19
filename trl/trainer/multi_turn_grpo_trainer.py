@@ -38,6 +38,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
                 prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
             gen_config = GenerationConfig(do_sample=True, top_p=0.9, repetition_penalty=1.1, temperature=0.7, max_length=self.max_completion_length)
+            print(f"1. BEFORE the 'with' block, self.model.training is: {self.model.training}")
 
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
                 print("------------------------------------------")
