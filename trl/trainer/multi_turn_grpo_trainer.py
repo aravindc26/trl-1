@@ -4,6 +4,7 @@ from typing import Union, Any, List
 import torch
 from ..trainer.grpo_trainer import GRPOTrainer
 import torch.nn as nn
+from transformers import GenerationConfig
 
 class MultiTurnGRPOTrainer(GRPOTrainer):
     def _pad_and_stack_tensors(self, tensor_list: List[torch.Tensor], pad_value: int) -> torch.Tensor:
@@ -36,8 +37,10 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
                 prompt_ids = prompt_ids[:, -self.max_prompt_length :]
                 prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
+            gen_config = GenerationConfig(max_length=self.max_completion_length, do_sample=True, top_p=0.9, repetition_penalty=1.1, temperature=0.7)
+
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask) 
+                prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=gen_config) 
 
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
