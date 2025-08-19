@@ -59,6 +59,7 @@ class Neo4jKGEnv:
                          {"role":"user","content":obs}]
         else:
             self.end = True
+            self.history += [{"role":"assistant","content":action}]
         return self.history
 
     def reset(self, initial_prompt: str):
