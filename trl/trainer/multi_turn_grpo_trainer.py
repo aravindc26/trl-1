@@ -37,7 +37,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
                 prompt_ids = prompt_ids[:, -self.max_prompt_length :]
                 prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
-            gen_config = GenerationConfig(do_sample=True, top_p=0.9, repetition_penalty=1.1, temperature=0.7)
+            gen_config = GenerationConfig(do_sample=True, top_p=0.9, repetition_penalty=1.1, temperature=0.7, max_length=self.max_completion_length)
 
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
                 print("------------------------------------------")
@@ -46,6 +46,8 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
                 print(f"After eval(), is model in training mode? {unwrapped_model.training}")
                 print("------------------------------------------")
                 prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=gen_config) 
+
+            print(f"3. AFTER the 'with' block, self.model.training is: {self.model.training}")
 
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
