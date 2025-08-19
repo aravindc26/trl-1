@@ -28,7 +28,8 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         turns = 0
         while not env.ended():
             print("history", history)
-            ctx_text = self.processing_class.apply_chat_template(history, tokenize=False, add_generation_prompt=True)
+            interaction = {"messages": history}
+            ctx_text = self.processing_class.apply_chat_template(interaction, tokenize=False, add_generation_prompt=True)
             prompt_inputs = self.processing_class(ctx_text, return_tensors="pt", max_length=self.max_prompt_length, 
                 padding=True, padding_side="left", add_special_tokens=False)
             prompt_ids, prompt_mask = prompt_inputs["input_ids"].to(self.accelerator.device), prompt_inputs["attention_mask"].to(self.accelerator.device)
