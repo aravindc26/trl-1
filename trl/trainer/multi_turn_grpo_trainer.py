@@ -27,7 +27,6 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         history = env.reset(input["question"])
         turns = 0
         while not env.ended():
-            print("history", history)
             ctx_text = self.processing_class.apply_chat_template(history, tokenize=False, add_generation_prompt=True)
             prompt_inputs = self.processing_class(ctx_text, return_tensors="pt", max_length=self.max_prompt_length, 
                 padding=True, padding_side="left", add_special_tokens=False)
@@ -38,24 +37,17 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
                 prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
             gen_config = GenerationConfig(do_sample=True, top_p=0.9, repetition_penalty=1.1, temperature=0.7, max_length=self.max_completion_length)
-            print(f"1. BEFORE the 'with' block, self.model.training is: {self.model.training}")
-
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                print("------------------------------------------")
-                print(f"Before eval(), is model in training mode? {unwrapped_model.training}")
                 unwrapped_model.eval()
-                print(f"After eval(), is model in training mode? {unwrapped_model.training}")
-                print("------------------------------------------")
                 prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=gen_config) 
 
-            print(f"3. AFTER the 'with' block, self.model.training is: {self.model.training}")
+            self.model.train()
 
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
             
             completion = self.processing_class.decode(completion_ids[0], skip_special_tokens=True)
-            print("completion", completion)
             history = env.move(completion)
             turns += 1
             if turns >= self.args.max_turns:
