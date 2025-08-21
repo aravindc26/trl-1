@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 from transformers import GenerationConfig
 from ..trainer.grpo_trainer import GRPOTrainer
+import torch.nn.functional as F
+
 
 class MultiTurnGRPOTrainer(GRPOTrainer):
     # ====== config for memory logging ======
@@ -118,6 +120,72 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         prompt_ids = prompt_ids_cpu.to("cpu")
         prompt_mask = prompt_mask_cpu.to("cpu")
         return prompt_completion_ids, prompt_ids, prompt_mask, history, env
+
+    # Get the per-token log probabilities for the completions for the model and the reference model
+    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
+        """
+        Memory-efficient version:
+        • Runs the prompt once to build past_key_values
+        • Then streams 1 token at a time to score the *next* token (teacher forcing)
+        • Returns log-probs for the last `logits_to_keep` tokens (shape: B, K)
+        """
+        assert logits_to_keep > 0, "logits_to_keep must be > 0"
+        B, L = input_ids.shape
+        K = int(logits_to_keep)
+        assert K <= L, f"logits_to_keep={K} cannot exceed sequence length L={L}"
+        pref = L - K  # prompt length
+
+        def score_chunk(ids, mask):
+            b = ids.size(0)
+            device = ids.device
+            # 1) Run the prompt to build KV cache
+            out = model(
+                input_ids=ids[:, :pref],
+                attention_mask=(mask[:, :pref] if mask is not None else None),
+                use_cache=True,
+                return_dict=True,
+            )
+            past = out.past_key_values
+
+            # Prepare output buffer (float32 for stable log-softmax even if model is bf16/fp16)
+            logps = torch.empty((b, K), device=device, dtype=torch.float32)
+
+            # Score token at position `pref` using the last prompt logits
+            last_logits = out.logits[:, -1, :].float()                # (b, V)
+            tgt = ids[:, pref]                                        # (b,)
+            logps[:, 0] = F.log_softmax(last_logits, dim=-1).gather(1, tgt.unsqueeze(1)).squeeze(1)
+
+            # 2) Stream the rest: feed true previous token, score the next (teacher forcing)
+            cur = tgt
+            one_mask = None
+            if mask is not None:
+                one_mask = torch.ones((b, 1), dtype=mask.dtype, device=device)
+
+            for i in range(1, K):
+                out = model(
+                    input_ids=cur.unsqueeze(1),           # (b, 1)
+                    attention_mask=one_mask,              # minimal mask for the new token
+                    use_cache=True,
+                    past_key_values=past,
+                    return_dict=True,
+                )
+                past = out.past_key_values
+                next_logits = out.logits[:, -1, :].float()
+                tgt = ids[:, pref + i]
+                logps[:, i] = F.log_softmax(next_logits, dim=-1).gather(1, tgt.unsqueeze(1)).squeeze(1)
+                cur = tgt
+
+            return logps
+
+        # Optional batch chunking to cap activations if B is large
+        bs = self.args.logits_batch_size or B
+        outs = []
+        for i in range(0, B, bs):
+            ids_chunk = input_ids[i:i + bs]
+            mask_chunk = (attention_mask[i:i + bs] if attention_mask is not None else None)
+            outs.append(score_chunk(ids_chunk, mask_chunk))
+        return torch.cat(outs, dim=0)
+
 
     # ---------- collation for training ----------
     def _prepare_inputs(
