@@ -24,16 +24,6 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         )
         return padded_tensors.to(self.accelerator.device)
 
-
-    def training_step(self, model, inputs, num_items_in_batch):
-        # This will profile a small window of steps (e.g., from step 5 to 9)
-        # to avoid the overhead of profiling the entire run.
-        torch.cuda.memory._record_memory_history(max_entries=100000)
-        loss = super().training_step(model, inputs, num_items_in_batch)
-        torch.cuda.memory._dump_snapshot("profile.pkl")
-        torch.cuda.memory._record_memory_history(enabled=None)
-        return loss
-
     def _get_prompt_completion(self, input):
         env = self.args.env_class(**self.args.env_init_kwargs)
         history = env.reset(input["question"])
