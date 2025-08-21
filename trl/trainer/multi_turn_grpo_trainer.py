@@ -121,70 +121,174 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         prompt_mask = prompt_mask_cpu.to("cpu")
         return prompt_completion_ids, prompt_ids, prompt_mask, history, env
 
-    # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
         """
-        Memory-efficient version:
-        • Runs the prompt once to build past_key_values
-        • Then streams 1 token at a time to score the *next* token (teacher forcing)
-        • Returns log-probs for the last `logits_to_keep` tokens (shape: B, K)
+        Memory-flat scoring of the last `logits_to_keep` tokens with logs enabled by default.
+        Streams BOTH the prefix (to build KV cache) and the completion (to score) so we never
+        hold (B, L, V) or (B, K, V) in memory.
+
+        Defaults:
+        • Logs are always printed (text + memory).
+        • Set self.args.logits_prefix_chunk to >1 (e.g., 8/16) to speed up prefix streaming.
         """
-        assert logits_to_keep > 0, "logits_to_keep must be > 0"
-        B, L = input_ids.shape
-        K = int(logits_to_keep)
-        assert K <= L, f"logits_to_keep={K} cannot exceed sequence length L={L}"
-        pref = L - K  # prompt length
+        # ---- tiny logging helpers (always on) ----
+        def dlog(msg: str):
+            # only main process prints if accelerator exists
+            if hasattr(self, "accelerator") and not self.accelerator.is_main_process:
+                return
+            print(f"[logps] {msg}")
 
-        def score_chunk(ids, mask):
-            b = ids.size(0)
-            device = ids.device
-            # 1) Run the prompt to build KV cache
-            out = model(
-                input_ids=ids[:, :pref],
-                attention_mask=(mask[:, :pref] if mask is not None else None),
-                use_cache=True,
-                return_dict=True,
-            )
-            past = out.past_key_values
+        def memlog(tag: str):
+            # prefer trainer's mem logger if present
+            if hasattr(self, "_log_gpu_mem"):
+                try:
+                    self._log_gpu_mem(tag)
+                    return
+                except Exception:
+                    pass
+            if not torch.cuda.is_available():
+                return
+            if hasattr(self, "accelerator") and not self.accelerator.is_main_process:
+                return
+            dev = torch.cuda.current_device()
+            alloc = torch.cuda.memory_allocated(dev) / 1e6
+            reserv = torch.cuda.memory_reserved(dev) / 1e6
+            peak  = torch.cuda.max_memory_allocated(dev) / 1e6
+            print(f"[MEM] {tag:<18} | alloc={alloc:8.1f} MB  reserved={reserv:8.1f} MB  peak={peak:8.1f} MB")
 
-            # Prepare output buffer (float32 for stable log-softmax even if model is bf16/fp16)
-            logps = torch.empty((b, K), device=device, dtype=torch.float32)
+        try:
+            assert logits_to_keep > 0, "logits_to_keep must be > 0"
+            B, L = input_ids.shape
+            K = int(logits_to_keep)
+            assert K <= L, f"logits_to_keep={K} cannot exceed sequence length L={L}"
+            device = input_ids.device
+            pref = L - K  # prefix length
 
-            # Score token at position `pref` using the last prompt logits
-            last_logits = out.logits[:, -1, :].float()                # (b, V)
-            tgt = ids[:, pref]                                        # (b,)
-            logps[:, 0] = F.log_softmax(last_logits, dim=-1).gather(1, tgt.unsqueeze(1)).squeeze(1)
+            # stream prefix in small chunks (1 = flattest memory; raise for speed)
+            prefix_chunk = int(getattr(self.args, "logits_prefix_chunk", 1))
+            prefix_chunk = max(1, prefix_chunk)
 
-            # 2) Stream the rest: feed true previous token, score the next (teacher forcing)
-            cur = tgt
-            one_mask = None
-            if mask is not None:
-                one_mask = torch.ones((b, 1), dtype=mask.dtype, device=device)
+            # header
+            try:
+                model_dev = next(model.parameters()).device
+            except StopIteration:
+                model_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            dlog(f"start: B={B}, L={L}, K={K}, pref={pref}, chunk={prefix_chunk}, "
+                f"ids_dev={device}, model_dev={model_dev}")
+            memlog("logps_start")
 
-            for i in range(1, K):
-                out = model(
-                    input_ids=cur.unsqueeze(1),           # (b, 1)
-                    attention_mask=one_mask,              # minimal mask for the new token
-                    use_cache=True,
-                    past_key_values=past,
-                    return_dict=True,
-                )
+            @torch.inference_mode()
+            def log_softmax_gather_last(logits_last, tgt_ids):
+                # logits_last: (b, V), tgt_ids: (b,)
+                out = F.log_softmax(logits_last.float(), dim=-1).gather(1, tgt_ids.unsqueeze(1)).squeeze(1)
+                if torch.isnan(out).any() or torch.isinf(out).any():
+                    dlog("WARNING: NaN/Inf detected in gathered log probs")
+                return out
+
+            past = None
+            last_logits = None
+
+            # ---------- 1) Stream PREFIX to build KV cache ----------
+            if pref > 0:
+                j = 0
+                chunk_idx = 0
+                while j < pref:
+                    end = min(pref, j + prefix_chunk)
+                    dlog(f"prefix chunk {chunk_idx}: [{j}:{end})")
+                    try:
+                        out = model(
+                            input_ids=input_ids[:, j:end],
+                            attention_mask=(attention_mask[:, j:end] if attention_mask is not None else None),
+                            use_cache=True,
+                            return_dict=True,
+                            past_key_values=past,
+                        )
+                    except Exception as e:
+                        dlog(f"ERROR in prefix forward at chunk [{j}:{end}): {e}")
+                        dlog(f"input_ids chunk shape={(input_ids[:, j:end]).shape}, "
+                            f"attn chunk shape={None if attention_mask is None else (attention_mask[:, j:end]).shape}")
+                        memlog("error_prefix_chunk")
+                        raise
+                    past = out.past_key_values
+                    last_logits = out.logits[:, -1, :]  # (b, V)
+                    if torch.isnan(last_logits).any() or torch.isinf(last_logits).any():
+                        dlog("WARNING: NaN/Inf in last_logits (prefix)")
+                    memlog(f"prefix_chunk_{chunk_idx}")
+                    j = end
+                    chunk_idx += 1
+
+                # score token at position `pref`
+                tgt0 = input_ids[:, pref]
+                logp0 = log_softmax_gather_last(last_logits, tgt0)
+            else:
+                # No prefix: do a 1-token warmup
+                dlog("no prefix; warmup 1-token forward")
+                try:
+                    out = model(
+                        input_ids=input_ids[:, 0:1],
+                        attention_mask=(attention_mask[:, 0:1] if attention_mask is not None else None),
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                except Exception as e:
+                    dlog(f"ERROR in warmup forward (no prefix): {e}")
+                    memlog("error_warmup")
+                    raise
                 past = out.past_key_values
-                next_logits = out.logits[:, -1, :].float()
-                tgt = ids[:, pref + i]
-                logps[:, i] = F.log_softmax(next_logits, dim=-1).gather(1, tgt.unsqueeze(1)).squeeze(1)
+                tgt0 = input_ids[:, 0]
+                logp0 = log_softmax_gather_last(out.logits[:, -1, :], tgt0)
+                memlog("warmup_done")
+
+            # output buffer
+            logps = torch.empty((B, K), device=device, dtype=torch.float32)
+            logps[:, 0] = logp0
+
+            # minimal mask for single-token continuation
+            one_mask = None
+            if attention_mask is not None:
+                one_mask = torch.ones((B, 1), dtype=attention_mask.dtype, device=device)
+
+            # ---------- 2) Stream COMPLETION ----------
+            cur = tgt0
+            for i in range(1, K):
+                # occasional progress + mem log
+                if i <= 3 or i == K - 1 or (i % 64 == 0):
+                    dlog(f"completion step i={i}/{K-1}")
+                    memlog(f"completion_i={i}")
+                try:
+                    out = model(
+                        input_ids=cur.unsqueeze(1),    # (b, 1)
+                        attention_mask=one_mask,
+                        use_cache=True,
+                        past_key_values=past,
+                        return_dict=True,
+                    )
+                except Exception as e:
+                    dlog(f"ERROR in completion forward at i={i}: {e}")
+                    memlog("error_completion_step")
+                    raise
+                past = out.past_key_values
+                nxt_logits = out.logits[:, -1, :]  # (b, V)
+                if torch.isnan(nxt_logits).any() or torch.isinf(nxt_logits).any():
+                    dlog(f"WARNING: NaN/Inf in nxt_logits at i={i}")
+
+                tgt = input_ids[:, (pref + i) if pref > 0 else i]
+                logps[:, i] = log_softmax_gather_last(nxt_logits, tgt)
                 cur = tgt
+
+            dlog(f"done: logps shape={tuple(logps.shape)}, dtype={logps.dtype}, device={logps.device}")
+            memlog("logps_done")
+            if torch.isnan(logps).any() or torch.isinf(logps).any():
+                dlog("WARNING: NaN/Inf detected in final logps")
 
             return logps
 
-        # Optional batch chunking to cap activations if B is large
-        bs = self.args.logits_batch_size or B
-        outs = []
-        for i in range(0, B, bs):
-            ids_chunk = input_ids[i:i + bs]
-            mask_chunk = (attention_mask[i:i + bs] if attention_mask is not None else None)
-            outs.append(score_chunk(ids_chunk, mask_chunk))
-        return torch.cat(outs, dim=0)
+        except Exception as exc:
+            # Final catch-all with context; re-raise to fail loudly in training
+            dlog(f"FATAL in _get_per_token_logps: {type(exc).__name__}: {exc}")
+            memlog("fatal_logps")
+            raise
+
 
 
     # ---------- collation for training ----------
