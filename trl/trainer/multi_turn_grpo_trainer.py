@@ -4,7 +4,7 @@ from typing import Union, Any, List, Dict, Optional
 import torch
 import torch.nn as nn
 from transformers import GenerationConfig
-from torch.profiler import profile, ProfilerActivity
+from ..trainer.grpo_trainer import GRPOTrainer
 
 class MultiTurnGRPOTrainer(GRPOTrainer):
     # ====== config for memory logging ======
@@ -136,13 +136,13 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
                 envs.append(env)
 
         prompt_completion_ids = self._pad_and_stack_tensors(
-            pc_list, pad_value=self.processing_class.pad_token_id, dtype=torch.long
+            pc_list, pad_value=self.processing_class.pad_token_id
         )
         prompt_ids = self._pad_and_stack_tensors(
-            p_list, pad_value=self.processing_class.pad_token_id, dtype=torch.long
+            p_list, pad_value=self.processing_class.pad_token_id
         )
         prompt_mask = self._pad_and_stack_tensors(
-            pm_list, pad_value=0, dtype=torch.long
+            pm_list, pad_value=0
         )
 
         prompt_length = prompt_ids.size(1)
