@@ -28,31 +28,10 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
     def training_step(self, model, inputs, num_items_in_batch):
         # This will profile a small window of steps (e.g., from step 5 to 9)
         # to avoid the overhead of profiling the entire run.
-        if self.state.global_step >= 1 and self.state.global_step < 2:
-            
-            # Start the profiler context manager
-            with profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                profile_memory=True,  # Enable memory profiling
-                record_shapes=True,
-                with_stack=True       # Helps trace memory back to the code
-            ) as prof:
-                # Call the original training_step from the parent class
-                # This ensures the actual training logic (forward, backward, etc.) still runs
-                loss = super().training_step(model, inputs, num_items_in_batch)
-
-            # After the last profiled step (step 9), print the results and stop
-            if self.state.global_step == 1:
-                print("--- MEMORY PROFILER RESULTS ---")
-                print(prof.key_averages(group_by_stack_n=5).table(sort_by="self_cuda_memory_usage", row_limit=15))
-                print("stopping..")
-                # This tells the trainer to stop training gracefully
-                self.state.is_training = False
-        
-        else:
-            # For all other steps, just run the normal training logic without the profiler
-            loss = super().training_step(model, inputs, num_items_in_batch)
-
+        torch.cuda.memory._record_memory_history(max_entries=100000)
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        torch.cuda.memory._dump_snapshot("profile.pkl")
+        torch.cuda.memory._record_memory_history(enabled=None)
         return loss
 
     def _get_prompt_completion(self, input):
