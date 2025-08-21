@@ -1,93 +1,167 @@
 from ..data_utils import apply_chat_template, is_conversational
 from ..models import unwrap_model_for_generation
-from typing import Union, Any, List
+from typing import Union, Any, List, Dict, Optional
 import torch
-from ..trainer.grpo_trainer import GRPOTrainer
 import torch.nn as nn
 from transformers import GenerationConfig
 from torch.profiler import profile, ProfilerActivity
 
-
 class MultiTurnGRPOTrainer(GRPOTrainer):
-    def _pad_and_stack_tensors(self, tensor_list: List[torch.Tensor], pad_value: int) -> torch.Tensor:
-        """Pads a list of 1D tensors to the same length and stacks them."""
-        # Note: This assumes tensors are 1D. For 2D tensors like prompt_completion_ids,
-        # you might need to handle padding differently or ensure they have a consistent shape.
-        # This implementation handles the expected 1D/2D shapes from _get_prompt_completion.
-        
-        # Squeeze tensors from [1, L] to [L] if necessary
-        squeezed_tensors = [t.squeeze(0) for t in tensor_list]
+    # ====== config for memory logging ======
+    _mem_log_every: int = 1  # set to 0 to disable, or e.g. 10 to log every 10 steps
 
-        # Pad to the length of the longest tensor in the list
-        padded_tensors = nn.utils.rnn.pad_sequence(
-            squeezed_tensors, batch_first=True, padding_value=pad_value
+    # ---------- utilities ----------
+    def _pad_and_stack_tensors(
+        self,
+        tensor_list: List[torch.Tensor],
+        pad_value: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        squeezed = [t.squeeze(0) for t in tensor_list]
+        if dtype is None:
+            dtype = squeezed[0].dtype
+        padded = nn.utils.rnn.pad_sequence(
+            squeezed, batch_first=True, padding_value=pad_value
         )
-        return padded_tensors.to(self.accelerator.device)
+        return padded.to(dtype=dtype, device="cpu")
 
-    def _get_prompt_completion(self, input):
+    def _log_gpu_mem(self, tag: str) -> None:
+        """Print allocated/reserved/peak (MB) on the current CUDA device."""
+        if not torch.cuda.is_available():
+            return
+        if hasattr(self, "accelerator") and not self.accelerator.is_main_process:
+            return
+        dev = torch.cuda.current_device()
+        alloc = torch.cuda.memory_allocated(dev) / 1e6
+        reserv = torch.cuda.memory_reserved(dev) / 1e6
+        peak = torch.cuda.max_memory_allocated(dev) / 1e6
+        print(f"[MEM] {tag:<18} | alloc={alloc:8.1f} MB  reserved={reserv:8.1f} MB  peak={peak:8.1f} MB")
+
+    # ---------- training ----------
+    def training_step(self, model, inputs, num_items_in_batch):
+        step = getattr(self.state, "global_step", 0)
+        if self._mem_log_every and (step % self._mem_log_every == 0):
+            torch.cuda.reset_peak_memory_stats()
+            self._log_gpu_mem("before_step")
+
+        loss = super().training_step(model, inputs, num_items_in_batch)
+
+        if self._mem_log_every and (step % self._mem_log_every == 0):
+            self._log_gpu_mem("after_step")
+        return loss
+
+    # ---------- rollout ----------
+    @torch.no_grad()
+    def _get_prompt_completion(self, example: Dict[str, Any]):
+        device = self.accelerator.device
         env = self.args.env_class(**self.args.env_init_kwargs)
-        history = env.reset(input["question"])
+        history = env.reset(example["question"])
         turns = 0
+
         while not env.ended():
-            ctx_text = self.processing_class.apply_chat_template(history, tokenize=False, add_generation_prompt=True)
-            prompt_inputs = self.processing_class(ctx_text, return_tensors="pt", max_length=self.max_prompt_length, 
-                padding=True, padding_side="left", add_special_tokens=False)
-            prompt_ids, prompt_mask = prompt_inputs["input_ids"].to(self.accelerator.device), prompt_inputs["attention_mask"].to(self.accelerator.device)
+            ctx_text = self.processing_class.apply_chat_template(
+                history, tokenize=False, add_generation_prompt=True
+            )
+            prompt_inputs = self.processing_class(
+                ctx_text,
+                return_tensors="pt",
+                max_length=self.max_prompt_length,
+                padding=True,
+                padding_side="left",
+                add_special_tokens=False,
+            )
+            prompt_ids_cpu = prompt_inputs["input_ids"]
+            prompt_mask_cpu = prompt_inputs["attention_mask"]
 
             if self.max_prompt_length is not None:
-                prompt_ids = prompt_ids[:, -self.max_prompt_length :]
-                prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+                prompt_ids_cpu = prompt_ids_cpu[:, -self.max_prompt_length :]
+                prompt_mask_cpu = prompt_mask_cpu[:, -self.max_prompt_length :]
 
-            gen_config = GenerationConfig(do_sample=True, top_p=0.9, repetition_penalty=1.1, temperature=0.7, max_length=self.max_completion_length)
-            with torch.no_grad():
-                with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                    unwrapped_model.eval()
-                    prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=gen_config) 
+            prompt_ids = prompt_ids_cpu.to(device, non_blocking=True)
+            prompt_mask = prompt_mask_cpu.to(device, non_blocking=True)
+
+            gen_config = GenerationConfig(
+                do_sample=True,
+                top_p=0.9,
+                repetition_penalty=1.1,
+                temperature=0.7,
+                max_new_tokens=self.max_completion_length,  # bounded
+                use_cache=True,
+            )
+
+            with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped:
+                unwrapped.eval()
+                prompt_completion_ids_dev = unwrapped.generate(
+                    prompt_ids,
+                    attention_mask=prompt_mask,
+                    generation_config=gen_config,
+                )
+
+            if self._mem_log_every:
+                self._log_gpu_mem("after_generate")
 
             self.model.train()
 
-            prompt_length = prompt_ids.size(1)
-            prompt_ids = prompt_completion_ids[:, :prompt_length]
-            completion_ids = prompt_completion_ids[:, prompt_length:]
-            
-            completion = self.processing_class.decode(completion_ids[0], skip_special_tokens=True)
-            print("completion", completion)
-            history = env.move(completion)
+            prompt_len = prompt_ids.size(1)
+            completion_ids_dev = prompt_completion_ids_dev[:, prompt_len:]
+            completion_text = self.processing_class.decode(
+                completion_ids_dev[0], skip_special_tokens=True
+            )
+            print("completion", completion_text)
+
+            history = env.move(completion_text)
             turns += 1
             if turns >= self.args.max_turns:
                 break
+
+        prompt_completion_ids = prompt_completion_ids_dev.to("cpu")
+        prompt_ids = prompt_ids_cpu.to("cpu")
+        prompt_mask = prompt_mask_cpu.to("cpu")
         return prompt_completion_ids, prompt_ids, prompt_mask, history, env
 
-    def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+    # ---------- collation for training ----------
+    def _prepare_inputs(
+        self, inputs: List[Dict[str, Union[torch.Tensor, Any]]]
+    ) -> Dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
-        prompt_completion_ids, prompt_ids, prompt_mask, histories, envs = [], [], [], [], []
-        for input in inputs:
+
+        pc_list, p_list, pm_list, histories, envs = [], [], [], [], []
+        for example in inputs:
             for _ in range(self.num_generations):
-                pc_ids, p_ids, p_mask, h, env = self._get_prompt_completion(input)
-                prompt_completion_ids.append(pc_ids)
-                prompt_ids.append(p_ids)
-                prompt_mask.append(p_mask)
+                pc_ids, p_ids, p_mask, h, env = self._get_prompt_completion(example)
+                pc_list.append(pc_ids)
+                p_list.append(p_ids)
+                pm_list.append(p_mask)
                 histories.append(h)
                 envs.append(env)
-        
-        prompt_completion_ids = self._pad_and_stack_tensors(prompt_completion_ids, pad_value=self.processing_class.pad_token_id)
-        prompt_ids = self._pad_and_stack_tensors(prompt_ids, pad_value=self.processing_class.pad_token_id)
-        prompt_mask = self._pad_and_stack_tensors(prompt_mask, pad_value=0)
+
+        prompt_completion_ids = self._pad_and_stack_tensors(
+            pc_list, pad_value=self.processing_class.pad_token_id, dtype=torch.long
+        )
+        prompt_ids = self._pad_and_stack_tensors(
+            p_list, pad_value=self.processing_class.pad_token_id, dtype=torch.long
+        )
+        prompt_mask = self._pad_and_stack_tensors(
+            pm_list, pad_value=0, dtype=torch.long
+        )
 
         prompt_length = prompt_ids.size(1)
-        completion_ids = prompt_completion_ids[:, prompt_length:]
+        completion_ids = prompt_completion_ids[:, prompt_length:]  # CPU
 
-        # Mask everything after the first EOS token
-        is_eos = completion_ids == self.processing_class.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        eos = (completion_ids == self.processing_class.eos_token_id)
+        seq_len = completion_ids.size(1)
+        eos_any = eos.any(dim=1)
+        first_eos = torch.full((eos.size(0),), seq_len, dtype=torch.long, device="cpu")
+        if eos_any.any():
+            first_eos[eos_any] = eos[eos_any].int().argmax(dim=1)
+        arange = torch.arange(seq_len, device="cpu").expand_as(eos)
+        completion_mask = (arange <= first_eos.unsqueeze(1)).to(dtype=torch.long)
 
-        # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # CPU
+        logits_to_keep = completion_ids.size(1)
 
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        prompt_completion_ids = prompt_completion_ids.to(device, non_blocking=True)
+        attention_mask = attention_mask.to(device, non_blocking=True)
 
         with torch.inference_mode():
             if self.ref_model is not None:
@@ -99,68 +173,72 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
                     ref_per_token_logps = self._get_per_token_logps(
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
-        
-        prompts = [history[:-1] for history in histories]
-        # Decode the generated completions
-        completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        if is_conversational(inputs[0]):
-            completions = [[{"role": "assistant", "content": completion}] for completion in completions]
 
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        if self._mem_log_every:
+            self._log_gpu_mem("after_ref_logps")
+
+        prompts = [h[:-1] for h in histories]
+        completions = self.processing_class.batch_decode(
+            completion_ids, skip_special_tokens=True
+        )
+        if is_conversational(inputs[0]):
+            completions = [[{"role": "assistant", "content": c}] for c in completions]
+
+        rewards_per_func = torch.zeros(
+            len(prompts), len(self.reward_funcs), device=device
+        )
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
-            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+            if isinstance(reward_func, nn.Module):
                 if is_conversational(inputs[0]):
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                 else:
                     texts = [p + c for p, c in zip(prompts, completions)]
+
                 reward_inputs = reward_processing_class(
                     texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                 )
                 reward_inputs = super()._prepare_inputs(reward_inputs)
                 with torch.inference_mode():
-                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
+                del reward_inputs
             else:
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
-                for key in reward_kwargs:
-                    for example in inputs:
-                        # Repeat each value in the column for `num_generations` times
-                        reward_kwargs[key].extend([example[key]] * self.num_generations)
-                output_reward_func = reward_func(prompts=prompts, completions=completions, envs=envs, **reward_kwargs)
-                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                reward_kwargs = {k: [] for k in inputs[0].keys() if k not in ["prompt", "completion"]}
+                for k in reward_kwargs:
+                    for ex in inputs:
+                        reward_kwargs[k].extend([ex[k]] * self.num_generations)
+                output_reward = reward_func(prompts=prompts, completions=completions, envs=envs, **reward_kwargs)
+                rewards_per_func[:, i] = torch.tensor(output_reward, dtype=torch.float32, device=device)
 
-        # Sum the rewards from all reward functions
+        if self._mem_log_every:
+            self._log_gpu_mem("after_rewards")
+
         rewards = rewards_per_func.sum(dim=1)
+        G = self.num_generations
+        mean_grouped = rewards.view(-1, G).mean(dim=1)
+        std_grouped = rewards.view(-1, G).std(dim=1)
+        mean_grouped = mean_grouped.repeat_interleave(G, dim=0)
+        std_grouped = std_grouped.repeat_interleave(G, dim=0)
+        advantages = (rewards - mean_grouped) / (std_grouped + 1e-4)
 
-        # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-
-        # Log the metrics
         reward_per_func = self.accelerator.gather_for_metrics(rewards_per_func).mean(0)
         for i, reward_func in enumerate(self.reward_funcs):
-            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+            if isinstance(reward_func, nn.Module):
                 reward_func_name = reward_func.config._name_or_path.split("/")[-1]
             else:
                 reward_func_name = reward_func.__name__
             self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
 
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
-        self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
+        self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped).mean().item())
 
         return {
-            "prompt_ids": prompt_ids,
-            "prompt_mask": prompt_mask,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
+            "prompt_ids": prompt_ids.to(device, non_blocking=True),
+            "prompt_mask": prompt_mask.to(device, non_blocking=True),
+            "completion_ids": completion_ids.to(device, non_blocking=True),
+            "completion_mask": completion_mask.to(device, non_blocking=True),
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
-        }    
+        }
