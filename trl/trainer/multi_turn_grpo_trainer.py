@@ -5,6 +5,8 @@ import torch
 from ..trainer.grpo_trainer import GRPOTrainer
 import torch.nn as nn
 from transformers import GenerationConfig
+from torch.profiler import profile, ProfilerActivity
+
 
 class MultiTurnGRPOTrainer(GRPOTrainer):
     def _pad_and_stack_tensors(self, tensor_list: List[torch.Tensor], pad_value: int) -> torch.Tensor:
@@ -22,7 +24,6 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         )
         return padded_tensors.to(self.accelerator.device)
 
-    from torch.profiler import profile, ProfilerActivity
 
     def training_step(self, model, inputs, num_items_in_batch):
         # This will profile a small window of steps (e.g., from step 5 to 9)
