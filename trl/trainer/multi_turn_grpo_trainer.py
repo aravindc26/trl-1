@@ -37,9 +37,10 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
                 prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
             gen_config = GenerationConfig(do_sample=True, top_p=0.9, repetition_penalty=1.1, temperature=0.7, max_length=self.max_completion_length)
-            with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                unwrapped_model.eval()
-                prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=gen_config) 
+            with torch.no_grad():
+                with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+                    unwrapped_model.eval()
+                    prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=gen_config) 
 
             self.model.train()
 
