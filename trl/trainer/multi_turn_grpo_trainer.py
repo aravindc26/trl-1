@@ -24,7 +24,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
 
     from torch.profiler import profile, ProfilerActivity
 
-    def training_step(self, model, inputs):
+    def training_step(self, model, inputs, num_items_in_batch):
         # This will profile a small window of steps (e.g., from step 5 to 9)
         # to avoid the overhead of profiling the entire run.
         if self.state.global_step >= 1 and self.state.global_step < 3:
@@ -38,7 +38,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
             ) as prof:
                 # Call the original training_step from the parent class
                 # This ensures the actual training logic (forward, backward, etc.) still runs
-                loss = super().training_step(model, inputs)
+                loss = super().training_step(model, inputs, num_items_in_batch)
 
             # After the last profiled step (step 9), print the results and stop
             if self.state.global_step == 2:
@@ -50,7 +50,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         
         else:
             # For all other steps, just run the normal training logic without the profiler
-            loss = super().training_step(model, inputs)
+            loss = super().training_step(model, inputs, num_items_in_batch)
 
         return loss
 
