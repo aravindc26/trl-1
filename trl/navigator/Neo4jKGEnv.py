@@ -1,6 +1,7 @@
 from neo4j import GraphDatabase
+from neo4j.exceptions import ServiceUnavailable, TransientError, Neo4jError
 from typing import List, Callable, Dict, Any
-import re
+import time, random, re
 
 class Neo4jKGEnv:
     """
@@ -18,13 +19,85 @@ class Neo4jKGEnv:
     ):
         if embed_fn is None:
             raise ValueError("embed_fn must be provided")
-        self.embed_fn   = embed_fn
-        self.driver     = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_pwd))
-        self.top_k      = top_k
+
+        self.embed_fn = embed_fn
+        self.top_k = top_k
         self.reset_called = False
         self.end = False
         self.history, self.trajectory, self.cache, self.actions = [], [], {}, []
 
+        # save creds for reconnection
+        self._neo4j_uri = neo4j_uri
+        self._neo4j_user = neo4j_user
+        self._neo4j_pwd  = neo4j_pwd
+
+        # create driver with retry + backoff
+        self.driver = self._create_driver_with_retry()
+
+    # ---------- retry utilities ----------
+    def _sleep_backoff(self, attempt: int, base: float, cap: float) -> None:
+        # full jitter: base * 2^attempt, capped, multiplied by random [0,1)
+        delay = min(cap, base * (2 ** attempt)) * random.random()
+        time.sleep(delay)
+
+    def _create_driver_with_retry(self, max_retries: int = 6, base: float = 0.25, cap: float = 4.0):
+        last = None
+        for attempt in range(max_retries + 1):
+            try:
+                drv = GraphDatabase.driver(self._neo4j_uri, auth=(self._neo4j_user, self._neo4j_pwd))
+                # Ensure the cluster is actually reachable
+                try:
+                    drv.verify_connectivity()
+                except AttributeError:
+                    # Older drivers may not have verify_connectivity; do a quick ping
+                    with drv.session() as s:
+                        s.run("RETURN 1").consume()
+                return drv
+            except (ServiceUnavailable, TransientError) as e:
+                last = e
+                if attempt == max_retries:
+                    raise
+                self._sleep_backoff(attempt, base, cap)
+            except Neo4jError:
+                # Non-transient errors (auth, query syntax, etc.) shouldn't be retried.
+                raise
+        # Should never get here
+        raise last if last else RuntimeError("Failed to create Neo4j driver")
+
+    def _run_with_retry(self, func, max_retries: int = 6, base: float = 0.1, cap: float = 2.0):
+        last = None
+        for attempt in range(max_retries + 1):
+            try:
+                return func()
+            except (ServiceUnavailable, TransientError) as e:
+                last = e
+                # Recreate driver (connection may be broken)
+                try:
+                    self.driver.close()
+                except Exception:
+                    pass
+                self.driver = self._create_driver_with_retry()
+                if attempt == max_retries:
+                    raise
+                self._sleep_backoff(attempt, base, cap)
+            except Neo4jError:
+                # Non-transient: surface immediately
+                raise
+        raise last if last else RuntimeError("Neo4j operation failed")
+
+    def _query_data(self, cypher: str, **params):
+        def work():
+            with self.driver.session() as s:
+                return s.run(cypher, **params).data()
+        return self._run_with_retry(work)
+
+    def _query_single(self, cypher: str, **params):
+        def work():
+            with self.driver.session() as s:
+                return s.run(cypher, **params).single()
+        return self._run_with_retry(work)
+
+    # ---------- rest of your env ----------
     def parse_cmd(self, text: str) -> Dict[str, Any]:
         _NAV = re.compile(r'^navigate\(([A-Za-z0-9_\-\/.#]+)\)$')
         _STOP = re.compile(r"stop\s*\(\s*\)", re.I)
@@ -68,16 +141,16 @@ class Neo4jKGEnv:
 
         vec = self.embed_fn(initial_prompt)
 
-        with self.driver.session() as s:
-            docs = s.run(
-                "CALL db.index.vector.queryNodes('document_embedding_index',$k,$vec)"
-                " YIELD node,score RETURN node{.*,score:score,type:'Document'} AS res",
-                k=self.top_k, vec=vec).data()
-
-            secs = s.run(
-                "CALL db.index.vector.queryNodes('section_embedding_index',$k,$vec)"
-                " YIELD node,score RETURN node{.*,score:score,type:'Section'} AS res",
-                k=self.top_k, vec=vec).data()
+        docs = self._query_data(
+            "CALL db.index.vector.queryNodes('document_embedding_index',$k,$vec) "
+            "YIELD node,score RETURN node{.*,score:score,type:'Document'} AS res",
+            k=self.top_k, vec=vec
+        )
+        secs = self._query_data(
+            "CALL db.index.vector.queryNodes('section_embedding_index',$k,$vec) "
+            "YIELD node,score RETURN node{.*,score:score,type:'Section'} AS res",
+            k=self.top_k, vec=vec
+        )
 
         def fmt(r):
             r = r["res"]
@@ -116,12 +189,11 @@ You have following options available, as response:
 </navigation-options>
 
 <input>
-	<question>{initial_prompt}</question>
-	<starting-nodes>
+    <question>{initial_prompt}</question>
+    <starting-nodes>
         {listing}
-	</starting-nodes>
+    </starting-nodes>
 </input>
-
         """
 
         self.history.append({"role": "user", "content": prompt})
@@ -154,14 +226,20 @@ You have following options available, as response:
         return obs, done
 
     def _fetch(self, node_id):
-        with self.driver.session() as s:
-            rec = s.run(
-                "MATCH (n {id:$id}) OPTIONAL MATCH (n)--(m)"
-                " RETURN n{.*,type:labels(n)[0]} AS n,"
-                "        collect(m{.*,type:labels(m)[0],id:m.id}) AS neigh",
-                id=node_id).single()
-            return (None, []) if rec is None else (rec["n"], rec["neigh"])
+        rec = self._query_single(
+            "MATCH (n {id:$id}) OPTIONAL MATCH (n)--(m) "
+            "RETURN n{.*,type:labels(n)[0]} AS n, "
+            "       collect(m{.*,type:labels(m)[0],id:m.id}) AS neigh",
+            id=node_id
+        )
+        return (None, []) if rec is None else (rec["n"], rec["neigh"])
 
     def _require_reset(self):
         if not self.reset_called:
             raise RuntimeError("Call reset() before navigate() or stop().")
+
+    def __del__(self):
+        try:
+            self.driver.close()
+        except Exception:
+            pass
