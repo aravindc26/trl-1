@@ -50,6 +50,9 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
 
         if self._mem_log_every and (step % self._mem_log_every == 0):
             self._log_gpu_mem("after_step")
+        
+        self._maybe_empty_cuda_cache(tag="post_step", min_gap_mb=4096)
+
         return loss
 
     # ---------- rollout ----------
@@ -121,6 +124,21 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         prompt_mask = prompt_mask_cpu.to("cpu")
         return prompt_completion_ids, prompt_ids, prompt_mask, history, env
 
+    # Add this helper in your trainer class
+    def _maybe_empty_cuda_cache(self, tag: str, min_gap_mb: int = 4096):
+        if not torch.cuda.is_available():
+            return
+        alloc = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        gap_mb = (reserved - alloc) / (1024**2)
+        if gap_mb >= min_gap_mb:
+            # drop any big temporaries first
+            torch.cuda.empty_cache()
+            if hasattr(self, "_log_gpu_mem"):
+                self._log_gpu_mem(f"{tag}_emptied")
+
+
+
 
     # in MultiTurnGRPOTrainer
     def _get_per_token_logps(
@@ -170,6 +188,8 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
             target_ids = input_ids[:, -logits_to_keep:]
             per_token_logps = torch.gather(log_probs[:, -logits_to_keep:, :],
                                         dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+            
+            self._maybe_empty_cuda_cache(tag="after_logps")
             return per_token_logps
 
 
