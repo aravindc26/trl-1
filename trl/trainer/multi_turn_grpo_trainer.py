@@ -11,6 +11,7 @@ import torch.nn.functional as F
 class MultiTurnGRPOTrainer(GRPOTrainer):
     # ====== config for memory logging ======
     _mem_log_every: int = 1  # set to 0 to disable, or e.g. 10 to log every 10 steps
+    use_amp_for_scoring: bool = True   # <-- CHANGED: shrink logits buffers via AMP (bf16/fp16)
 
     # ---------- utilities ----------
     def _pad_and_stack_tensors(
@@ -50,8 +51,9 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
 
         if self._mem_log_every and (step % self._mem_log_every == 0):
             self._log_gpu_mem("after_step")
-        
-        torch.cuda.empty_cache()
+
+        # Be selective about cache clearing (only if fragmentation gap is large)
+        self._maybe_empty_cuda_cache(tag="post_step", min_gap_mb=4096)
         return loss
 
     # ---------- rollout ----------
@@ -118,11 +120,13 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
             if turns >= self.args.max_turns:
                 break
 
+        # move to CPU to free VRAM
         prompt_completion_ids = prompt_completion_ids_dev.to("cpu")
         prompt_ids = prompt_ids_cpu.to("cpu")
         prompt_mask = prompt_mask_cpu.to("cpu")
         return prompt_completion_ids, prompt_ids, prompt_mask, history, env
 
+    # ---------- cache helper ----------
     def _maybe_empty_cuda_cache(self, tag: str, min_gap_mb: int = 4096):
         if not torch.cuda.is_available():
             return
@@ -130,11 +134,11 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         reserved = torch.cuda.memory_reserved()
         gap_mb = (reserved - alloc) / (1024**2)
         if gap_mb >= min_gap_mb:
-            # drop any big temporaries first
             torch.cuda.empty_cache()
             if hasattr(self, "_log_gpu_mem"):
                 self._log_gpu_mem(f"{tag}_emptied")
 
+    # ---------- scoring (policy/ref) ----------
     def _get_per_token_logps(
         self,
         model,
@@ -148,11 +152,10 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         Memory-efficient per-token log-probs:
         log p(y) = logits[..., y] - logsumexp(logits, dim=-1)
 
-        Shapes:
-        input_ids           : (B, L)
-        attention_mask      : (B, L)
-        logits_to_keep (K)  : int (num last positions to score)
-        returns             : (B, K)
+        input_ids      : (B, L)
+        attention_mask : (B, L)
+        logits_to_keep : K (score last K positions)
+        returns        : (B, K) tensor
         """
         # tiny runtime check (prints once per call)
         try:
@@ -160,45 +163,50 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         except StopIteration:
             model_dev = torch.device("cpu")
         print(f"[logps] start: B={input_ids.size(0)}, L={input_ids.size(1)}, "
-            f"K={logits_to_keep}, enable_grad={enable_grad}, model_dev={model_dev}")
+              f"K={logits_to_keep}, enable_grad={enable_grad}, model_dev={model_dev}")
 
         ctx = torch.enable_grad() if enable_grad else torch.no_grad()
         with ctx:
-            # Helper to run a forward on a (possibly sliced) batch and return per-token logps
             def _forward_slice(ids, mask):
-                out = model(
-                    input_ids=ids,
-                    attention_mask=mask,
-                    logits_to_keep=logits_to_keep + 1,  # ensure K+1 positions available
-                    use_cache=False,                     # scoring: no KV growth needed
-                    return_dict=True,
-                )
-                # logits over the last K positions (aligning targets t=1..K to logits at 0..K-1)
-                logits = out.logits[:, -logits_to_keep-1:-1, :]      # (b, K, V)
-                targets = ids[:, -logits_to_keep:]                   # (b, K)
+                # AMP to shrink temporary logits (optional)
+                maybe_amp = torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
+                ) if (self.use_amp_for_scoring and torch.cuda.is_available()) else contextlib.nullcontext()
 
-                # Memory-efficient log prob of targets: gather - logsumexp
-                logZ = torch.logsumexp(logits, dim=-1)               # (b, K)
-                gathered = torch.gather(logits, -1,
-                                        targets.unsqueeze(-1)).squeeze(-1)  # (b, K)
-                return gathered - logZ                                # (b, K)
+                with maybe_amp:
+                    out = model(
+                        input_ids=ids,
+                        attention_mask=mask,
+                        logits_to_keep=logits_to_keep + 1,
+                        use_cache=False,     # scoring: no KV cache growth
+                        return_dict=True,
+                    )
+                    logits = out.logits[:, -logits_to_keep-1:-1, :]  # (b, K, V)
+
+                # compute log p(target) without full softmax persisting
+                targets = ids[:, -logits_to_keep:]                 # (b, K)
+                logZ = torch.logsumexp(logits, dim=-1)             # (b, K)
+                gathered = torch.gather(logits, -1, targets.unsqueeze(-1)).squeeze(-1)  # (b, K)
+
+                # free logits ASAP
+                del logits
+                return (gathered - logZ).to(dtype=torch.float32)   # keep result in fp32
 
             if self.args.logits_batch_size is None:
                 per_token_logps = _forward_slice(input_ids, attention_mask)
             else:
                 bs = int(self.args.logits_batch_size)
-                pts = []
+                chunks = []
                 for i in range(0, input_ids.size(0), bs):
                     sl = slice(i, min(i + bs, input_ids.size(0)))
-                    pts.append(_forward_slice(input_ids[sl], attention_mask[sl]))
-                    # Trim allocator pressure between mini-batches
+                    chunks.append(_forward_slice(input_ids[sl], attention_mask[sl]))
                     if (i // bs) % 2 == 0:
-                        torch.cuda.empty_cache()
-                per_token_logps = torch.cat(pts, dim=0)
+                        self._maybe_empty_cuda_cache("logps_chunk", min_gap_mb=2048)
+                per_token_logps = torch.cat(chunks, dim=0)
 
-        torch.cuda.empty_cache()
+        self._maybe_empty_cuda_cache("after_logps", min_gap_mb=2048)
         return per_token_logps
-
 
     # ---------- collation for training ----------
     def _prepare_inputs(
@@ -241,6 +249,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # CPU
         logits_to_keep = completion_ids.size(1)
 
+        # Move only what we need to device
         prompt_completion_ids = prompt_completion_ids.to(device, non_blocking=True)
         attention_mask = attention_mask.to(device, non_blocking=True)
 
@@ -258,6 +267,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         if self._mem_log_every:
             self._log_gpu_mem("after_ref_logps")
 
+        # Decode on CPU
         prompts = [h[:-1] for h in histories]
         completions = self.processing_class.batch_decode(
             completion_ids, skip_special_tokens=True
@@ -265,6 +275,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         if is_conversational(inputs[0]):
             completions = [[{"role": "assistant", "content": c}] for c in completions]
 
+        # Rewards do not require grad
         rewards_per_func = torch.zeros(
             len(prompts), len(self.reward_funcs), device=device
         )
@@ -296,13 +307,14 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         if self._mem_log_every:
             self._log_gpu_mem("after_rewards")
 
+        # Aggregate rewards -> advantages (no grad)
         rewards = rewards_per_func.sum(dim=1)
         G = self.num_generations
         mean_grouped = rewards.view(-1, G).mean(dim=1)
         std_grouped = rewards.view(-1, G).std(dim=1)
         mean_grouped = mean_grouped.repeat_interleave(G, dim=0)
         std_grouped = std_grouped.repeat_interleave(G, dim=0)
-        advantages = (rewards - mean_grouped) / (std_grouped + 1e-4)
+        advantages = ((rewards - mean_grouped) / (std_grouped + 1e-4)).detach()  # <-- CHANGED
 
         reward_per_func = self.accelerator.gather_for_metrics(rewards_per_func).mean(0)
         for i, reward_func in enumerate(self.reward_funcs):
@@ -315,11 +327,14 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
         self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped).mean().item())
 
+        # free some temporaries on device
+        self._maybe_empty_cuda_cache("prep_return", min_gap_mb=2048)
+
         return {
             "prompt_ids": prompt_ids.to(device, non_blocking=True),
             "prompt_mask": prompt_mask.to(device, non_blocking=True),
             "completion_ids": completion_ids.to(device, non_blocking=True),
             "completion_mask": completion_mask.to(device, non_blocking=True),
-            "ref_per_token_logps": ref_per_token_logps,
-            "advantages": advantages,
+            "ref_per_token_logps": ref_per_token_logps,  # fp32 (B,K)
+            "advantages": advantages,                    # detached (B,)
         }
