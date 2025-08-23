@@ -51,8 +51,7 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         if self._mem_log_every and (step % self._mem_log_every == 0):
             self._log_gpu_mem("after_step")
         
-        self._maybe_empty_cuda_cache(tag="post_step", min_gap_mb=4096)
-
+        torch.cuda.empty_cache()
         return loss
 
     # ---------- rollout ----------
@@ -146,7 +145,14 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
         enable_grad: bool = True,
     ):
         """
-        Computes per-token log-probs with memory-efficient processing.
+        Memory-efficient per-token log-probs:
+        log p(y) = logits[..., y] - logsumexp(logits, dim=-1)
+
+        Shapes:
+        input_ids           : (B, L)
+        attention_mask      : (B, L)
+        logits_to_keep (K)  : int (num last positions to score)
+        returns             : (B, K)
         """
         # tiny runtime check (prints once per call)
         try:
@@ -158,99 +164,41 @@ class MultiTurnGRPOTrainer(GRPOTrainer):
 
         ctx = torch.enable_grad() if enable_grad else torch.no_grad()
         with ctx:
-            if self.args.logits_batch_size is None:
-                # OPTIMIZED: Process logits in smaller chunks to avoid OOM
+            # Helper to run a forward on a (possibly sliced) batch and return per-token logps
+            def _forward_slice(ids, mask):
                 out = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    logits_to_keep=logits_to_keep + 1,
-                    use_cache=False,
-                    return_dict=True
+                    input_ids=ids,
+                    attention_mask=mask,
+                    logits_to_keep=logits_to_keep + 1,  # ensure K+1 positions available
+                    use_cache=False,                     # scoring: no KV growth needed
+                    return_dict=True,
                 )
-                
-                # Get only the relevant logits
-                logits = out.logits[:, -logits_to_keep-1:-1, :]  # (B, K, V)
-                
-                # Compute log_softmax and gather in one step to minimize memory
-                target_ids = input_ids[:, -logits_to_keep:].unsqueeze(-1)  # (B, K, 1)
-                
-                # Process in chunks if batch is large
-                B = logits.size(0)
-                chunk_size = max(1, min(4, B))  # Process up to 4 sequences at a time
-                per_token_logps_list = []
-                
-                for i in range(0, B, chunk_size):
-                    end_idx = min(i + chunk_size, B)
-                    chunk_logits = logits[i:end_idx]
-                    chunk_targets = target_ids[i:end_idx]
-                    
-                    # Compute log_softmax for this chunk
-                    chunk_log_probs = F.log_softmax(chunk_logits, dim=-1)
-                    
-                    # Gather the log probs for the target tokens
-                    chunk_per_token_logps = torch.gather(
-                        chunk_log_probs, 
-                        dim=-1, 
-                        index=chunk_targets
-                    ).squeeze(-1)
-                    
-                    per_token_logps_list.append(chunk_per_token_logps)
-                    
-                    # Clear intermediate tensors
-                    del chunk_logits, chunk_log_probs
-                
-                per_token_logps = torch.cat(per_token_logps_list, dim=0)
-                del logits, target_ids, per_token_logps_list
-                
+                # logits over the last K positions (aligning targets t=1..K to logits at 0..K-1)
+                logits = out.logits[:, -logits_to_keep-1:-1, :]      # (b, K, V)
+                targets = ids[:, -logits_to_keep:]                   # (b, K)
+
+                # Memory-efficient log prob of targets: gather - logsumexp
+                logZ = torch.logsumexp(logits, dim=-1)               # (b, K)
+                gathered = torch.gather(logits, -1,
+                                        targets.unsqueeze(-1)).squeeze(-1)  # (b, K)
+                return gathered - logZ                                # (b, K)
+
+            if self.args.logits_batch_size is None:
+                per_token_logps = _forward_slice(input_ids, attention_mask)
             else:
-                # Use existing batching logic with optimization
-                bs = self.args.logits_batch_size
-                per_token_logps_list = []
-                
+                bs = int(self.args.logits_batch_size)
+                pts = []
                 for i in range(0, input_ids.size(0), bs):
-                    batch_slice = slice(i, min(i+bs, input_ids.size(0)))
-                    out = model(
-                        input_ids=input_ids[batch_slice],
-                        attention_mask=attention_mask[batch_slice],
-                        logits_to_keep=logits_to_keep + 1,
-                        use_cache=False,
-                        return_dict=True
-                    )
-                    
-                    # Process this batch's logits immediately
-                    batch_logits = out.logits[:, -logits_to_keep-1:-1, :]
-                    batch_targets = input_ids[batch_slice, -logits_to_keep:].unsqueeze(-1)
-                    
-                    # Compute log_softmax and gather in smaller sub-chunks if needed
-                    sub_chunk_size = 2  # Process 2 sequences at a time within batch
-                    batch_per_token_logps = []
-                    
-                    for j in range(0, batch_logits.size(0), sub_chunk_size):
-                        end_j = min(j + sub_chunk_size, batch_logits.size(0))
-                        sub_logits = batch_logits[j:end_j]
-                        sub_targets = batch_targets[j:end_j]
-                        
-                        sub_log_probs = F.log_softmax(sub_logits, dim=-1)
-                        sub_per_token_logps = torch.gather(
-                            sub_log_probs,
-                            dim=-1,
-                            index=sub_targets
-                        ).squeeze(-1)
-                        
-                        batch_per_token_logps.append(sub_per_token_logps)
-                        del sub_logits, sub_log_probs
-                    
-                    per_token_logps_list.append(torch.cat(batch_per_token_logps, dim=0))
-                    del batch_logits, batch_targets, out
-                    
-                    # Empty cache after each major batch
-                    if i % (bs * 2) == 0:
+                    sl = slice(i, min(i + bs, input_ids.size(0)))
+                    pts.append(_forward_slice(input_ids[sl], attention_mask[sl]))
+                    # Trim allocator pressure between mini-batches
+                    if (i // bs) % 2 == 0:
                         torch.cuda.empty_cache()
-                
-                per_token_logps = torch.cat(per_token_logps_list, dim=0)
-            
-            self._maybe_empty_cuda_cache(tag="after_logps", min_gap_mb=2048)
-            return per_token_logps
+                per_token_logps = torch.cat(pts, dim=0)
+
+        torch.cuda.empty_cache()
+        return per_token_logps
+
 
     # ---------- collation for training ----------
     def _prepare_inputs(
